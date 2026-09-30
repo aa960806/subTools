@@ -1,0 +1,16 @@
+services:
+  subtools:
+    build: .
+    restart: unless-stopped
+    init: false
+    shm_size: 1gb
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      SUBTOOLS_PUBLIC_ORIGIN: ${SUBTOOLS_PUBLIC_ORIGIN:-http://localhost:8787}
+      SUBTOOLS_ADMIN_PASSWORD: ${SUBTOOLS_ADMIN_PASSWORD:-}
+      SUBTOOLS_ADMIN_PASSWORD_FILE: /app/data/initial-password.txt
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+    stop_grace_period: 60s

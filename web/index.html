@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>SubTools · 账号工作台</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div id="login" class="login">
+      <form id="login-form" class="login-card">
+        <div class="brand-icon">S</div>
+        <h1>SubTools</h1>
+        <p>登录你的账号工作台</p>
+        <label
+          >管理员密码<input
+            id="login-password"
+            type="password"
+            autocomplete="current-password"
+            required /></label
+        ><button class="primary">进入工作台 <span>→</span></button>
+        <p id="login-error" class="error"></p>
+        <small>账号处理与数据管理 · 私有工作空间</small>
+      </form>
+    </div>
+    <div id="app" hidden>
+      <aside>
+        <div class="brand">
+          <span class="brand-icon">S</span>
+          <div><b>SubTools</b><small>账号工作台</small></div>
+        </div>
+        <small class="nav-label">账号处理</small>
+        <nav>
+          <button data-page="auth">◈ <span>批量授权</span></button
+          ><button data-page="phone">▣ <span>手机接码</span></button>
+        </nav>
+        <small class="nav-label">数据管理</small>
+        <nav>
+          <button data-page="convert">⇄ <span>格式转换</span></button
+          ><button data-page="pool">↗ <span>推送到池</span></button
+          ><button data-page="history">◷ <span>任务历史</span></button>
+        </nav>
+        <div class="sidebar-bottom">
+          <span class="dot"></span> 独立工作空间<small>OpenAI / Codex</small
+          ><button id="logout" class="ghost">退出登录</button>
+        </div>
+      </aside>
+      <main>
+        <header>
+          <div>
+            <div class="eyebrow">
+              工作台 <span>/</span> <span id="breadcrumb">账号处理</span>
+            </div>
+            <h1 id="page-title">批量授权</h1>
+            <p id="page-description">重新获取账号凭据，成功结果自动保存。</p>
+          </div>
+          <div id="connection" class="badge">服务已连接</div>
+        </header>
+        <div id="toast" role="status" hidden></div>
+        <section id="work-page">
+          <div class="work-grid">
+            <div class="main-column">
+              <article class="card input-card">
+                <div class="card-heading">
+                  <h2>
+                    账号输入 <span id="count" class="badge">0 个账号</span>
+                  </h2>
+                  <div class="tools">
+                    <button id="import-files" class="ghost">↥ 导入文件</button
+                    ><button id="import-folder" class="ghost">导入目录</button
+                    ><button id="clear" class="ghost">清空</button>
+                  </div>
+                </div>
+                <p class="hint">
+                  支持账号行、sub2 / CPA / Session / 9router
+                  JSON；多个账号分行输入。
+                </p>
+                <textarea
+                  id="account-input"
+                  spellcheck="false"
+                  placeholder="粘贴账号或 JSON…"
+                  aria-label="账号输入"
+                ></textarea>
+                <div class="actions">
+                  <button id="recognize" class="secondary">识别输入</button
+                  ><button id="start" class="primary">
+                    开始授权 <span>→</span></button
+                  ><button id="stop" class="danger" disabled>停止</button
+                  ><span id="run-status" class="hint"></span>
+                </div>
+              </article>
+              <div class="stats">
+                <div>
+                  <small>成功</small
+                  ><strong id="stat-success" class="success">0</strong>
+                </div>
+                <div>
+                  <small>失败 / 需处理</small
+                  ><strong id="stat-failed" class="error">0</strong>
+                </div>
+                <div>
+                  <small>待处理</small><strong id="stat-pending">0</strong>
+                </div>
+              </div>
+              <article class="card results-card">
+                <div class="card-heading">
+                  <div class="segments">
+                    <button data-tab="results" class="selected">处理结果</button
+                    ><button data-tab="logs">运行记录</button
+                    ><button data-tab="inspection">只读巡检</button>
+                  </div>
+                  <button id="browser-open" class="ghost">
+                    查看登录浏览器 ↗
+                  </button>
+                </div>
+                <div class="progress"><div id="progress-bar"></div></div>
+                <div id="results-panel">
+                  <div class="tools result-tools">
+                    <input
+                      id="result-search"
+                      type="search"
+                      placeholder="搜索邮箱 / 状态"
+                    /><select id="result-state">
+                      <option value="">全部状态</option>
+                      <option value="success">成功</option>
+                      <option value="failed">需处理</option>
+                      <option value="ready">待处理</option>
+                      <option value="phone_required">待补手机</option></select
+                    ><button id="retry" class="ghost">重试失败</button
+                    ><button id="retry-selected" class="ghost">重试选中</button
+                    ><button id="defer" class="ghost">暂缓 / 恢复</button>
+                  </div>
+                  <div class="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>
+                            <input
+                              id="select-all"
+                              type="checkbox"
+                              aria-label="全选"
+                            />
+                          </th>
+                          <th>账号</th>
+                          <th>状态</th>
+                          <th>后台 ID</th>
+                          <th>处理结果</th>
+                        </tr>
+                      </thead>
+                      <tbody id="result-rows"></tbody>
+                    </table>
+                    <div id="result-empty" class="empty">
+                      <span>◈</span><b>准备好处理你的账号</b>
+                      <p>粘贴或导入账号，识别后开始。</p>
+                    </div>
+                  </div>
+                  <div class="actions result-actions">
+                    <button id="transfer-pool" class="ghost">
+                      成功结果推池 ↗</button
+                    ><button id="transfer-phone" class="ghost">
+                      待补手机转接码
+                    </button>
+                    <div class="spacer"></div>
+                    <button id="export-sub2" class="secondary">导出 sub2</button
+                    ><button id="export-cpa" class="secondary">导出 CPA</button>
+                  </div>
+                </div>
+                <pre id="logs-panel" hidden aria-live="polite"></pre>
+                <div id="inspection-panel" hidden>
+                  <p class="hint">
+                    仅读取后台保存的状态，不刷新凭据、不重登，也不修改账号。
+                  </p>
+                  <div class="actions">
+                    <button id="inspect" class="primary">立即巡检</button
+                    ><label class="inline"
+                      >间隔（分钟）<input
+                        id="inspect-minutes"
+                        type="number"
+                        value="15"
+                        min="1"
+                        max="1440" /></label
+                    ><button id="schedule" class="secondary">启用定时</button
+                    ><button id="inspection-export" class="ghost">
+                      导出报告
+                    </button>
+                  </div>
+                  <p id="inspection-status" class="hint">定时未启用</p>
+                  <pre id="inspection-report">尚无巡检结果</pre>
+                </div>
+              </article>
+            </div>
+            <article class="card settings">
+              <div class="card-heading">
+                <h2 id="settings-title">授权设置</h2>
+                <button id="save-settings" class="ghost">保存</button>
+              </div>
+              <div id="settings-body"></div>
+            </article>
+          </div>
+        </section>
+        <section id="convert-page" hidden>
+          <article class="card">
+            <div class="card-heading">
+              <h2>格式转换</h2>
+              <div class="tools">
+                <button id="convert-files" class="ghost">↥ 导入文件</button
+                ><button id="convert-folder" class="ghost">导入目录</button
+                ><select id="convert-target">
+                  <option value="sub2">完整 sub2</option>
+                  <option value="cpa">按邮箱拆分 CPA</option></select
+                ><button id="convert-clear" class="ghost">清空</button>
+              </div>
+            </div>
+            <div class="convert-grid">
+              <div>
+                <h3>原始数据</h3>
+                <textarea
+                  id="convert-input"
+                  placeholder="粘贴 sub2、CPA、Session 或 9router JSON…"
+                  spellcheck="false"
+                ></textarea>
+              </div>
+              <div>
+                <h3>
+                  JSON 预览
+                  <span id="convert-count" class="badge">尚未识别</span>
+                </h3>
+                <pre id="convert-preview">结果将在此显示</pre>
+              </div>
+            </div>
+            <div id="convert-warnings" class="warnings" hidden></div>
+            <div class="actions">
+              <button id="convert-preview-btn" class="primary">
+                识别并预览
+              </button>
+              <div class="spacer"></div>
+              <button id="convert-to-pool" class="ghost">转入推池</button
+              ><button id="convert-save" class="secondary">下载转换结果</button>
+            </div>
+          </article>
+        </section>
+        <section id="history-page" hidden>
+          <article class="card">
+            <div class="card-heading">
+              <h2>任务历史</h2>
+              <button id="history-refresh" class="ghost">刷新</button>
+            </div>
+            <p class="hint">
+              打开历史不会自动重新登录、推送或购买号码。运行中的任务在关闭网页后继续。
+            </p>
+            <div id="history-list"></div>
+            <h3>迁移的桌面记录</h3>
+            <div id="legacy-list"></div>
+          </article>
+        </section>
+        <footer>
+          SubTools <span>·</span> OAuth / PKCE <span>·</span> 私有账号工作台
+        </footer>
+      </main>
+    </div>
+    <input
+      id="file-picker"
+      type="file"
+      accept=".txt,.json"
+      multiple
+      hidden
+    /><input id="folder-picker" type="file" webkitdirectory multiple hidden />
+    <dialog id="browser-dialog">
+      <div class="card-heading">
+        <div>
+          <h2>登录浏览器</h2>
+          <p class="hint">
+            点击画面定位输入框，再发送文字或按键。验证码由你自行完成。
+          </p>
+        </div>
+        <button id="browser-close" class="ghost">关闭 ✕</button>
+      </div>
+      <div class="browser-frame">
+        <img id="browser-frame" alt="等待登录浏览器画面" />
+        <p id="browser-wait">等待浏览器启动；开始任务前请启用“显示浏览器”。</p>
+      </div>
+      <div class="actions">
+        <input
+          id="browser-text"
+          type="password"
+          placeholder="输入文字（不保存在日志）"
+          autocomplete="off"
+        /><button id="browser-send" class="secondary">发送文字</button
+        ><button data-key="Tab" class="ghost">Tab</button
+        ><button data-key="Control+A" class="ghost">全选</button
+        ><button data-key="Backspace" class="ghost">删除</button
+        ><button data-key="Enter" class="primary">Enter</button
+        ><button id="browser-up" class="ghost">↑</button
+        ><button id="browser-down" class="ghost">↓</button>
+      </div>
+    </dialog>
+  </body>
+</html>
