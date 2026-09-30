@@ -4,6 +4,14 @@ services:
     restart: unless-stopped
     init: false
     shm_size: 1gb
+    cpus: ${SUBTOOLS_CPU_LIMIT:-2.0}
+    mem_limit: ${SUBTOOLS_MEMORY_LIMIT:-3g}
+    pids_limit: 512
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:8787:8787"
     environment:
@@ -11,6 +19,12 @@ services:
       SUBTOOLS_ADMIN_PASSWORD: ${SUBTOOLS_ADMIN_PASSWORD:-}
       SUBTOOLS_ADMIN_PASSWORD_FILE: /app/data/initial-password.txt
       TZ: Asia/Shanghai
+      SUBTOOLS_MAX_ACCOUNTS: ${SUBTOOLS_MAX_ACCOUNTS:-200}
+      SUBTOOLS_TASK_CACHE: ${SUBTOOLS_TASK_CACHE:-20}
+      SUBTOOLS_ARCHIVE_DAYS: ${SUBTOOLS_ARCHIVE_DAYS:-30}
+      SUBTOOLS_SUBMITS_PER_MINUTE: ${SUBTOOLS_SUBMITS_PER_MINUTE:-12}
+      SUBTOOLS_QUERIES_PER_MINUTE: ${SUBTOOLS_QUERIES_PER_MINUTE:-60}
+      SUBTOOLS_IMPORTS_PER_MINUTE: ${SUBTOOLS_IMPORTS_PER_MINUTE:-300}
     volumes:
       - ./data:/app/data
     stop_grace_period: 60s

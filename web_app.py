@@ -10,6 +10,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -19,6 +20,7 @@ from server_engine import Engine, integer, export_bytes
 from reauth_conversion import parse_conversion_text
 from reauth_formats import build_export_payload, build_cpa_payload, conversion_warnings, account_conversion_status
 from phone_smsbower import COUNTRY_CATALOG, COUNTRY_PINYIN, country_label
+from web_limits import RequestBudget
 
 ROOT = Path(__file__).resolve().parent
 
@@ -29,6 +31,9 @@ def password_hash(password, salt):
 
 def create_app(data_dir=None, password=None):
     sessions, failures = {}, {}
+    submissions = RequestBudget(integer(os.environ.get('SUBTOOLS_SUBMITS_PER_MINUTE', '12'), '任务提交额度', 1, 1000))
+    queries = RequestBudget(integer(os.environ.get('SUBTOOLS_QUERIES_PER_MINUTE', '60'), '查询额度', 1, 10000))
+    imports = RequestBudget(integer(os.environ.get('SUBTOOLS_IMPORTS_PER_MINUTE', '300'), '导入校验额度', 1, 10000))
     @asynccontextmanager
     async def lifespan(app):
         from oauth_refresh import _refresh_lease
@@ -74,6 +79,14 @@ def create_app(data_dir=None, password=None):
             if request.method != 'GET' and not hmac.compare_digest(request.headers.get('x-csrf-token',''), session['csrf']):
                 return JSONResponse({'error':'页面会话已失效，请重新登录'},status_code=403)
             request.state.session = session
+            submission = request.method == 'POST' and (path == '/api/tasks' or path.endswith('/retry'))
+            expensive = request.method == 'POST' and path.startswith(('/api/pool/', '/api/sms/'))
+            processing = request.method == 'POST' and path.startswith(('/api/convert', '/api/preview/', '/api/import-preview/'))
+            if submission or expensive or processing:
+                retry = (submissions if submission else queries if expensive else imports).take()
+                if retry:
+                    return JSONResponse({'error': f'操作过于频繁，请 {retry} 秒后重试'}, status_code=429,
+                                        headers={'Retry-After': str(retry)})
         length = request.headers.get('content-length')
         if length and (not length.isdecimal() or int(length) > 20*1024*1024):
             return JSONResponse({'error':'请求不能超过 20 MB'},status_code=413)
@@ -156,7 +169,13 @@ def create_app(data_dir=None, password=None):
     @app.get('/api/status')
     def status():
         e=app.state.engine
-        return {'active':e.active,'schedule':e.schedule,'inspection':e.inspection,'platform':os.name,'warnings':e.warnings}
+        return {'active':e.active,'schedule':e.schedule,'inspection':e.inspection,'platform':os.name,'warnings':e.warnings,
+                'limits': {'max_accounts': e.max_accounts, 'archive_days': e.tasks.archive_days}}
+
+    @app.post('/api/import-preview/{kind}')
+    async def import_preview(kind: str, request: Request):
+        data = await payload(request)
+        return app.state.engine.import_preview(kind, data.get('text', ''))
 
     @app.post('/api/preview/{kind}')
     async def preview(kind:str,request:Request):
@@ -167,10 +186,30 @@ def create_app(data_dir=None, password=None):
     @app.post('/api/tasks')
     async def start(request:Request):
         data=await payload(request)
-        return app.state.engine.start(data.get('kind'),data.get('text',''))
+        return app.state.engine.start(data.get('kind'),data.get('text',''),
+                                      import_selected=data.get('import_selected'), fingerprint=data.get('fingerprint'))
 
     @app.get('/api/tasks')
     def tasks(): return app.state.engine.list_tasks()
+
+    @app.get('/api/history')
+    def history(offset: int = 0, limit: int = 25, archived: bool = False):
+        e = app.state.engine
+        with e.lock:
+            return e.tasks.page(integer(offset, '分页位置', 0, 10000000), integer(limit, '每页数量', 1, 100), archived)
+
+    @app.post('/api/tasks/{task_id}/archive')
+    async def archive(task_id: str, request: Request):
+        data = await payload(request)
+        archived = data.get('archived', True)
+        if type(archived) is not bool:
+            raise ValueError('归档状态无效')
+        e = app.state.engine
+        with e.lock:
+            if e.active == task_id:
+                raise ValueError('运行中的任务不能归档')
+            e.tasks.archive(task_id, archived)
+        return {'ok': True}
 
     @app.get('/api/tasks/{task_id}')
     def task(task_id:str): return app.state.engine.public(task_id)
@@ -198,7 +237,7 @@ def create_app(data_dir=None, password=None):
         return {'text':app.state.engine.transfer(task_id,data.get('target'),data.get('selected'))}
 
     @app.get('/api/tasks/{task_id}/export')
-    def download(task_id:str,target:str='sub2'):
+    def download(task_id:str,target:str='sub2', selected: str | None = None):
         e=app.state.engine
         with e.lock:
             t=e.get(task_id)
@@ -206,36 +245,32 @@ def create_app(data_dir=None, password=None):
                 if not t.get('report'): raise ValueError('巡检尚未完成')
                 content=json.dumps(t['report'],ensure_ascii=False,indent=2).encode();name='inspection.json';media='application/json'
             else:
-                accounts=[a for uid,a in t['accounts'].items() if any(r['uid']==uid and r['state'] in ('success','created','updated') for r in t['rows'])]
-                if not accounts: raise ValueError('尚无成功结果可导出')
+                accounts=e.export_accounts(task_id, selected.split(',') if selected is not None else None)
                 content,name,media,_=export_bytes(accounts,target)
-        return Response(content,media_type=media,headers={'Content-Disposition':f'attachment; filename="{name}"'})
+        return Response(content,media_type=media,headers={'Content-Disposition':f"attachment; filename*=UTF-8''{quote(name, safe='')}"})
 
     @app.get('/api/tasks/{task_id}/export-warnings')
-    def export_warnings(task_id:str,target:str='sub2'):
-        if target not in ('sub2','cpa'): raise ValueError('目标格式无效')
+    def export_warnings(task_id:str,target:str='sub2', selected: str | None = None):
+        if target not in ('sub2','sub2-single','cpa'): raise ValueError('目标格式无效')
         e=app.state.engine
         with e.lock:
-            t=e.get(task_id)
-            successful={r['uid'] for r in t['rows'] if r['state'] in ('success','created','updated')}
-            accounts=[a for uid,a in t['accounts'].items() if uid in successful]
-            if not accounts: raise ValueError('尚无成功结果可导出')
-            return {'warnings':conversion_warnings(accounts,target)}
+            accounts=e.export_accounts(task_id, selected.split(',') if selected is not None else None)
+            return {'warnings':conversion_warnings(accounts,'sub2' if target == 'sub2-single' else target)}
 
     @app.post('/api/convert')
     async def convert(request:Request):
         data=await payload(request);kind,accounts=parse_conversion_text(data.get('text',''))
         target=data.get('target','sub2')
-        if target not in ('sub2','cpa'): raise ValueError('目标格式无效')
-        return {'kind':kind,'count':len(accounts),'warnings':conversion_warnings(accounts,target),
+        if target not in ('sub2','sub2-single','cpa'): raise ValueError('目标格式无效')
+        return {'kind':kind,'count':len(accounts),'warnings':conversion_warnings(accounts,'sub2' if target == 'sub2-single' else target),
                 'rows':[account_conversion_status(a) for a in accounts],
-                'preview':build_export_payload(accounts) if target=='sub2' else [build_cpa_payload(a) for a in accounts]}
+                'preview':build_export_payload(accounts) if target=='sub2' else [build_export_payload([a]) for a in accounts] if target=='sub2-single' else [build_cpa_payload(a) for a in accounts]}
 
     @app.post('/api/convert/export')
     async def convert_export(request:Request):
         data=await payload(request);_,accounts=parse_conversion_text(data.get('text',''))
         content,name,media,_=export_bytes(accounts,data.get('target','sub2'))
-        return Response(content,media_type=media,headers={'Content-Disposition':f'attachment; filename="{name}"'})
+        return Response(content,media_type=media,headers={'Content-Disposition':f"attachment; filename*=UTF-8''{quote(name, safe='')}"})
 
     @app.post('/api/pool/{action}')
     async def pool_action(action:str,request:Request):

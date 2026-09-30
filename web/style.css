@@ -808,3 +808,9 @@ dialog .actions input {
     padding: 0 4px;
   }
 }
+/* Observed account stages, compact enough to retain the result table layout. */
+.step-trail { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.step-chip { font-size: 11px; line-height: 1.6; padding: 2px 7px; border: 1px solid #35413f; border-radius: 6px; color: #97a6a1; }
+.step-chip.active { color: #b7f5d8; border-color: #449b75; background: #20382e; }
+.step-chip.attention { color: #f3b5ac; border-color: #764c48; }
+td > small { display: block; }

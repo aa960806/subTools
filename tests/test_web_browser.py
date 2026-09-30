@@ -116,3 +116,49 @@ def test_browser_handoff_commands_and_cancellation(browser):
     stop.set();assert stop.is_set()
     detach();bind(None);page.close()
     assert bridge.page is None and bridge.frame is None
+
+
+def test_import_selection_archive_and_single_download(browser, site, monkeypatch):
+    import progress_events
+    def observed_login(items, **options):
+        for stage in ('page', 'email', 'password', 'otp', 'workspace', 'token'):
+            progress_events.emit(items[0].email, stage)
+        return fake_login(items, **options)
+    monkeypatch.setattr('server_engine.run_batch_reauth', observed_login)
+    page = browser.new_page(viewport={'width':1440, 'height':1000})
+    errors = []
+    page.on('pageerror', lambda e: errors.append(str(e)))
+    page.on('dialog', lambda d: d.accept())
+    page.goto(site)
+    page.locator('#login-password').fill('fixture-password-for-web')
+    page.locator('#login-form button').click()
+    page.locator('#app').wait_for(state='visible')
+    page.locator('#account-input').fill('fixture@example.com----fixture-pass\nbroken-line----private-fixture')
+    page.locator('#recognize').click()
+    expect(page.locator('[data-row="1"]')).to_be_disabled()
+    expect(page.locator('[data-row="0"]')).to_be_checked()
+    assert 'private-fixture' not in page.locator('#result-rows').inner_text()
+    page.locator('#start').click()
+    expect(page.locator('#stat-success')).to_have_text('1', timeout=15000)
+    expect(page.locator('.step-chip')).to_have_count(6)
+    expect(page.locator('.step-chip.active')).to_have_count(0)
+    page.screenshot(path='.browser-smoke/stages-desktop.png', full_page=True)
+    page.locator('[data-row="0"]').check()
+    with page.expect_download() as download:
+        page.locator('#export-cpa').click()
+    assert download.value.suggested_filename == 'fixture@example.com.json'
+    page.locator('[data-page=history]').click()
+    page.locator('[data-archive]').first.click()
+    expect(page.locator('[data-history]')).to_have_count(0)
+    page.locator('#history-filter').select_option('archived')
+    expect(page.locator('[data-history]')).to_have_count(1)
+    page.locator('[data-archive]').click()
+    expect(page.locator('[data-history]')).to_have_count(0)
+    page.locator('#history-filter').select_option('current')
+    expect(page.locator('[data-history]')).to_have_count(1)
+    page.locator('[data-history]').click()
+    expect(page.locator('#stat-success')).to_have_text('1')
+    page.set_viewport_size({'width':430, 'height':932})
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1')
+    assert not errors
+    page.close()

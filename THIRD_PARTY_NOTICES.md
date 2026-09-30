@@ -1,3 +1,11 @@
+# reauth-web design reference
+
+Source: https://github.com/boji1334/reauth-web
+
+Reviewed revision: `db8251817fd1baefc83c14c851135fb6078bc001` (2026-09-30), MIT License, Copyright (c) 2026 boji1334.
+
+The per-account stage display, partial import preview, configurable server budgets, and single/ZIP export choices were informed by `app/jobs.py`, `app/parsing.py`, `app/security.py`, `app/formats.py`, and `docker-compose.yml`. Their implementation here is local: existing Playwright, refresh recovery, SMS lifecycle, identity matching, and strict conversion routines remain in use. No upstream protocol-login, session cache, public-session authentication, or vendor library was incorporated. Encrypted lazy history and reversible archive management were implemented specifically for SubTools.
+
 # toSub2
 
 Source: https://github.com/poxiao33/toSub2

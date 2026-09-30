@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from urllib.parse import parse_qs, urlparse
 from dataclasses import dataclass, field
 
 import pyotp
@@ -29,6 +30,17 @@ def _email(value):
 
 
 def _totp(value):
+    if isinstance(value, str) and value.strip().lower().startswith('otpauth:'):
+        uri = urlparse(value.strip())
+        options = parse_qs(uri.query)
+        if (uri.scheme != 'otpauth' or uri.netloc != 'totp'
+                or len(options.get('secret', [])) != 1
+                or any(len(options.get(k, [])) > 1 for k in ('algorithm', 'digits', 'period'))
+                or options.get('algorithm', ['SHA1'])[0].upper() != 'SHA1'
+                or options.get('digits', ['6'])[0] != '6'
+                or options.get('period', ['30'])[0] != '30'):
+            raise ValueError('仅支持 SHA1 / 6 位 / 30 秒的 TOTP 地址')
+        value = options['secret'][0]
     value = re.sub(r"\s+", "", value or "").upper()
     if value:
         try:

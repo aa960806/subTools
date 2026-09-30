@@ -65,7 +65,10 @@ def test_default_authorization_keeps_existing_navigation_behavior(browser):
     callback.wait.return_value = expected
     session = core.OAuthSession("fixture-state", "fixture-verifier", core.DEFAULT_REDIRECT_URI, "https://auth.openai.com/oauth/authorize")
     try:
-        assert core.login_with_browser(page, core.AccountInput("test@example.com", "fixture-pw", "", 1),
-                                       session, callback, 30) is expected
+        with patch.object(core, "log") as log:
+            assert core.login_with_browser(page, core.AccountInput("test@example.com", "fixture-pw", "", 1),
+                                           session, callback, 30) is expected
+        assert any('HTTP 403' in call.args[0] for call in log.call_args_list)
+        assert all('fixture-pw' not in call.args[0] for call in log.call_args_list)
     finally:
         page.close()

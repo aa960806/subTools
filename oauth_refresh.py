@@ -287,6 +287,7 @@ def _refresh_account(account, *, proxy=None, should_stop=None, recovery_dir=None
 def run_refresh_first(inputs, *, authorize, refresh=None, on_progress=None, should_stop=None, **options):
     """GUI authorization entry. Failed refreshes only produce decision-needed results."""
     from openai_reauth import ReauthResult, log
+    from progress_events import emit
     refresh = refresh or refresh_account
     if not any(item.oauth_account for item in inputs):
         return authorize(inputs, on_progress=on_progress, should_stop=should_stop, **options)
@@ -295,6 +296,7 @@ def run_refresh_first(inputs, *, authorize, refresh=None, on_progress=None, shou
         if should_stop and should_stop():
             break
         if item.oauth_account:
+            emit(item.email, 'refresh')
             try:
                 recovered = recover_refresh_account(item.oauth_account, should_stop=should_stop,
                                                     recovery_dir=options.get("recovery_dir"))

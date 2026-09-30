@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, unquote
 
 import httpx
 import pyotp
+from progress_events import emit as emit_stage
 
 from reauth_proxy import normalize_proxy, playwright_proxy
 
@@ -748,8 +749,13 @@ def login_with_browser(
     if email_login is not None:
         email_login.prime(deadline, should_stop)
     log(f"{account.email}: 正在打开授权页")
+    emit_stage(account.email, 'page')
     human_delay(human, "open_page", should_stop=should_stop, deadline=deadline, log_fn=log)
     navigation = page.goto(session.auth_url, wait_until="domcontentloaded", timeout=min(30_000, int(timeout * 1000)))
+    if phone_handler is None and navigation is not None:
+        status = navigation.status
+        if isinstance(status, int) and not isinstance(status, bool) and status >= 400:
+            log(f"{account.email}: 授权页返回 HTTP {status}；等待后续页面或回调，请核对网络或显示浏览器检查")
     human_delay(human, "page_settle", should_stop=should_stop, deadline=deadline, log_fn=log)
     if phone_handler is not None and navigation is not None:
         status = navigation.status
@@ -822,6 +828,7 @@ def login_with_browser(
 
         phone_evidence = phone_page_evidence(page, parsed.path)
         if phone_evidence:
+            emit_stage(account.email, 'phone')
             # Give redirects and stale page contents a bounded settling window.
             # No SMS purchase or TOTP submission occurs during this observation.
             if pending_phone != phone_evidence:
@@ -885,6 +892,7 @@ def login_with_browser(
             continue
         maybe_handle_passkey_or_method_picker(page)
         if maybe_select_workspace(page):
+            emit_stage(account.email, 'workspace')
             continue
 
         interaction = ""
@@ -895,6 +903,7 @@ def login_with_browser(
         elif WORKSPACE_PROMPT.search(text):
             interaction = "需要选择工作区或组织"
         if interaction:
+            emit_stage(account.email, 'interaction')
             if headless:
                 # Text can render before the workspace controls. Give the page
                 # a short, bounded settling period before requiring a person.
@@ -938,6 +947,7 @@ def login_with_browser(
         )
 
         if email_input is not None and password_input is None and not filled_email:
+            emit_stage(account.email, 'email')
             human_delay(human, "type_email", should_stop=should_stop, deadline=deadline, log_fn=log)
             if not type_like_human(email_input, account.email, human, should_stop=should_stop, deadline=deadline, log_fn=log):
                 email_input.fill(account.email)
@@ -951,6 +961,7 @@ def login_with_browser(
             continue
 
         if password_input is not None and not filled_password:
+            emit_stage(account.email, 'password')
             if not str(account.password or "").strip():
                 if not headless:
                     if manual_reason != "password":
@@ -987,6 +998,7 @@ def login_with_browser(
             or re.search(r"authenticator|one-time code|enter code|verification code", text, re.I)
         )
         if otp_needed and (not filled_otp or now >= otp_retry_at):
+            emit_stage(account.email, 'otp')
             if not account.totp_secret:
                 if headless:
                     raise AuthFlowError("needs_interaction", "账号要求二次验证码但未提供 2FA 密钥；请显示浏览器手动完成")
@@ -1081,6 +1093,7 @@ def reauth_account(
         if not result.code:
             raise RuntimeError("OAuth callback missing authorization code")
         log(f"{account.email}: 正在换取 token")
+        emit_stage(account.email, 'token')
         exchange_options = {"trust_env": False}
         token = exchange_code(result.code, session.code_verifier, session.redirect_uri, proxy, **exchange_options)
         payload = build_account_payload(token, account.email)

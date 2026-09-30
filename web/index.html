@@ -82,6 +82,7 @@
                   placeholder="粘贴账号或 JSON…"
                   aria-label="账号输入"
                 ></textarea>
+                <div id="import-notices" class="warnings" hidden></div>
                 <div class="actions">
                   <button id="recognize" class="secondary">识别输入</button
                   ><button id="start" class="primary">
@@ -162,6 +163,8 @@
                       待补手机转接码
                     </button>
                     <div class="spacer"></div>
+                    <span class="hint">已勾选时仅导出选中成功项</span>
+                    <button id="export-sub2-single" class="ghost">拆分 sub2</button>
                     <button id="export-sub2" class="secondary">导出 sub2</button
                     ><button id="export-cpa" class="secondary">导出 CPA</button>
                   </div>
@@ -208,6 +211,7 @@
                 ><button id="convert-folder" class="ghost">导入目录</button
                 ><select id="convert-target">
                   <option value="sub2">完整 sub2</option>
+                  <option value="sub2-single">按账号拆分 sub2</option>
                   <option value="cpa">按邮箱拆分 CPA</option></select
                 ><button id="convert-clear" class="ghost">清空</button>
               </div>
@@ -244,12 +248,15 @@
           <article class="card">
             <div class="card-heading">
               <h2>任务历史</h2>
+              <select id="history-filter" aria-label="历史范围"><option value="current">当前任务</option><option value="archived">已归档</option></select>
               <button id="history-refresh" class="ghost">刷新</button>
             </div>
             <p class="hint">
               打开历史不会自动重新登录、推送或购买号码。运行中的任务在关闭网页后继续。
             </p>
             <div id="history-list"></div>
+            <div class="actions"><span id="history-count" class="hint"></span><div class="spacer"></div><button id="history-prev" class="ghost">上一页</button><button id="history-next" class="ghost">下一页</button></div>
+            <p class="hint">全部成功的完成任务默认 30 天后归档。归档可恢复，凭据、订单和恢复记录不会删除。</p>
             <h3>迁移的桌面记录</h3>
             <div id="legacy-list"></div>
           </article>

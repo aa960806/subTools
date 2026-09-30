@@ -25,8 +25,11 @@ from pool_flow import parse_push_text, run_pool_push
 from pool_inspection import inspect_pool, inspection_delta
 from pool_recovery import PoolJournal
 from reauth_conversion import parse_conversion_text
-from reauth_formats import build_export_payload, build_cpa_payload, safe_email_filename, conversion_warnings
+from reauth_formats import build_export_payload, build_cpa_payload, safe_email_filename, conversion_warnings, _conversion_identity
 from server_storage import Store
+from web_history import TaskHistory
+from web_imports import preview_import, select_import
+import progress_events
 
 DEFAULTS = {
     'auth': {'network_mode': 'direct', 'proxy': '', 'proxy_scheme': 'http', 'timeout': 180,
@@ -92,23 +95,32 @@ def sms_settings(config):
 
 
 def export_bytes(accounts, target):
-    warnings = conversion_warnings(accounts, target)
+    if target not in ('sub2', 'sub2-single', 'cpa'):
+        raise ValueError('目标格式无效')
+    if not accounts:
+        raise ValueError('没有可导出的账号')
+    warnings = conversion_warnings(accounts, 'sub2' if target == 'sub2-single' else target)
     if target == 'sub2':
         return json.dumps(build_export_payload(accounts), ensure_ascii=False, indent=2).encode(), 'accounts.json', 'application/json', warnings
-    if target != 'cpa':
-        raise ValueError('目标格式必须为 sub2 或 cpa')
+    members = []
     stream, used = io.BytesIO(), set()
+    for account in accounts:
+        payload = build_cpa_payload(account) if target == 'cpa' else build_export_payload([account])
+        email = payload['email'] if target == 'cpa' else _conversion_identity(account)['email'] or 'account'
+        stem, suffix = safe_email_filename(email), 1
+        name = stem + '.json'
+        while name.casefold() in used:
+            suffix += 1
+            name = f'{stem}__{suffix}.json'
+        used.add(name.casefold())
+        members.append((name, json.dumps(payload, ensure_ascii=False, indent=2).encode()))
+    if len(members) == 1:
+        name, content = members[0]
+        return content, name, 'application/json', warnings
     with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as archive:
-        for account in accounts:
-            payload = build_cpa_payload(account)
-            stem, suffix = safe_email_filename(payload['email']), 1
-            name = stem + '.json'
-            while name.casefold() in used:
-                suffix += 1
-                name = f'{stem}__{suffix}.json'
-            used.add(name.casefold())
-            archive.writestr(name, json.dumps(payload, ensure_ascii=False, indent=2))
-    return stream.getvalue(), 'cpa-accounts.zip', 'application/zip', warnings
+        for name, content in members:
+            archive.writestr(name, content)
+    return stream.getvalue(), f'{target}-accounts.zip', 'application/zip', warnings
 
 
 class Engine:
@@ -117,7 +129,10 @@ class Engine:
         self.store = Store(root)
         self.lock = threading.RLock()
         self.gate = threading.Lock()
-        self.tasks = {}
+        self.max_accounts = integer(os.environ.get('SUBTOOLS_MAX_ACCOUNTS', '200'), '单批账号上限', 1, 10000)
+        self.tasks = TaskHistory(self.store,
+            cache_size=integer(os.environ.get('SUBTOOLS_TASK_CACHE', '20'), '任务缓存', 1, 200),
+            archive_days=integer(os.environ.get('SUBTOOLS_ARCHIVE_DAYS', '30'), '自动归档天数', 0, 3650))
         self.active = None
         self.worker = None
         self.bridge = BrowserBridge()
@@ -125,17 +140,7 @@ class Engine:
         self.closed = threading.Event()
         self.schedule = None
         self.inspection = None
-        self.warnings = []
-        for file in sorted((self.root / 'tasks').glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True):
-            try:
-                task = self.store.read(file.relative_to(self.root))
-                if task['status'] == 'running':
-                    task['status'] = 'interrupted'
-                    task['message'] = '服务器上次中断；请检查结果后选择继续，不会自动重登或买号'
-                self.tasks[task['id']] = task
-            except Exception:
-                self.warnings.append(f'无法读取任务记录 {file.name}；原文件已保留，请核对数据密钥或备份')
-                continue
+        self.warnings = list(self.tasks.warnings)
         self.timer = threading.Thread(target=self._timer, daemon=True)
         self.timer.start()
 
@@ -170,22 +175,42 @@ class Engine:
         return self.config(kind, public=True)
 
     def _save(self, task):
-        self.store.write(f"tasks/{task['id']}.json", task)
+        self.tasks.save(task)
 
     def get(self, task_id):
-        if task_id not in self.tasks:
-            raise ValueError('任务不存在')
-        return self.tasks[task_id]
+        with self.lock:
+            if task_id not in self.tasks:
+                raise ValueError('任务不存在')
+            return self.tasks[task_id]
 
     def public(self, task_id):
         with self.lock:
             task = self.get(task_id)
-            return copy.deepcopy({k: task.get(k) for k in ('id', 'kind', 'status', 'created', 'message', 'rows', 'logs', 'report', 'warnings')})
+            result = copy.deepcopy({k: task.get(k) for k in ('id', 'kind', 'status', 'created', 'message', 'rows', 'logs', 'report', 'warnings')})
+            for row in result.get('rows', []):
+                end = time.time() if row.get('stage_active') else row.get('stage_finished', row.get('stage_started', 0))
+                row['stage_seconds'] = max(0, int(end - row.get('stage_started', end)))
+            return result
 
     def list_tasks(self):
         with self.lock:
-            return [{k: t.get(k) for k in ('id', 'kind', 'status', 'created', 'message')}
-                    for t in sorted(self.tasks.values(), key=lambda t:t['created'], reverse=True)[:200]]
+            return self.tasks.page(limit=200)['rows']
+
+    def import_preview(self, kind, text):
+        return preview_import(kind, text, self.max_accounts)[0]
+
+    def export_accounts(self, task_id, selected=None):
+        task = self.get(task_id)
+        if selected is not None:
+            if not isinstance(selected, list) or any(not isinstance(s, str) for s in selected) or not selected:
+                raise ValueError('请选择需要导出的成功账号')
+            if not set(selected) <= {r['uid'] for r in task['rows']}:
+                raise ValueError('选中账号不属于此任务')
+        successful = {r['uid'] for r in task['rows'] if r['state'] in ('success', 'created', 'updated')}
+        accounts = [a for uid, a in task['accounts'].items() if uid in successful and (selected is None or uid in selected)]
+        if not accounts:
+            raise ValueError('选中范围内没有成功结果可导出')
+        return accounts
 
     def preview(self, kind, text):
         if kind == 'pool':
@@ -194,7 +219,7 @@ class Engine:
         items = parse_phone_jobs(text) if kind == 'phone' else load_accounts(text)
         return [{'email':x.email, 'message':'已有凭据，优先刷新' if x.oauth_account else '等待 OAuth 登录'} for x in items]
 
-    def start(self, kind, text='', *, previous=None, selected=None, relogin=False):
+    def start(self, kind, text='', *, previous=None, selected=None, relogin=False, import_selected=None, fingerprint=None):
         if kind not in ('auth', 'phone', 'pool', 'inspect'):
             raise ValueError('任务类型无效')
         if not self.gate.acquire(blocking=False):
@@ -217,7 +242,7 @@ class Engine:
                         raise ValueError('任务类型不一致')
                     task = copy.deepcopy(task)
                 else:
-                    items = [] if kind == 'inspect' else parse_push_text(text) if kind == 'pool' else parse_phone_jobs(text) if kind == 'phone' else load_accounts(text)
+                    items = [] if kind == 'inspect' else select_import(kind, text, self.max_accounts, import_selected, fingerprint)
                     task = {'id':uuid.uuid4().hex, 'created':time.time(), 'kind':kind, 'status':'ready',
                             'items':[asdict(x) for x in items], 'rows':[], 'accounts':{}, 'logs':[], 'message':'等待处理', 'report':None}
                     task['rows'] = [{'uid':x.uid if kind == 'pool' else str(i), 'email':x.email, 'state':'ready', 'message':'等待处理', 'account_id':None}
@@ -232,9 +257,13 @@ class Engine:
                     raise ValueError('没有可处理账号；成功或暂缓账号不会重复执行')
                 if previous and kind != 'inspect' and (relogin or any(r['uid'] in chosen and r['state']=='needs_interaction' for r in task['rows'])):
                     config['show_browser'] = True
-                task.update(status='running', message='任务运行中', config=configs)
+                for row in task['rows']:
+                    if row['uid'] in chosen:
+                        row['state'] = 'ready'
+                        for key in ('stage', 'stage_started', 'stage_finished', 'steps', 'stage_active'):
+                            row.pop(key, None)
+                task.update(status='running', message='任务运行中', config=configs, finished=None)
                 self._save(task)
-                self.tasks[task['id']] = task
                 self.active = task['id']
                 self.bridge = BrowserBridge()
                 self.bridge.enabled = kind != 'inspect' and config.get('show_browser', False)
@@ -265,11 +294,34 @@ class Engine:
             with self.lock:
                 task['logs'].append(redact_diagnostic(str(message), tuple(secrets)))
                 task['logs'] = task['logs'][-1500:]
+        def stage(email, key):
+            with self.lock:
+                candidates = [r for r in task['rows'] if r['uid'] in chosen and r['email'].casefold() == email.casefold()
+                              and r['state'] in ('ready', 'not_processed', 'relogin', 'refreshing', 'pushing')]
+                if not candidates:
+                    return
+                row = next((r for r in candidates if r.get('stage_active')), candidates[0])
+                if row.get('stage') == key and row.get('stage_active'):
+                    return
+                now = time.time()
+                steps = row.setdefault('steps', [])
+                if steps and steps[-1]['status'] == 'active':
+                    steps[-1].update(status='done', seconds=max(0, int(now - steps[-1]['started'])))
+                steps.append({'key': key, 'label': progress_events.LABELS[key], 'status': 'active', 'started': now})
+                row['steps'] = steps[-20:]
+                row.update(stage=key, stage_started=now, stage_active=True)
+        def finish_stage(row):
+            row.update(stage_active=False, stage_finished=time.time())
+            if row.get('steps'):
+                step = row['steps'][-1]
+                step.update(status='done' if row['state'] in ('success', 'created', 'updated') else 'attention',
+                            seconds=max(0, int(time.time() - step['started'])))
         def progress(index, total, result):
             uid = chosen[index - 1]
             with self.lock:
                 row = next(r for r in task['rows'] if r['uid'] == uid)
                 row.update(state='success' if result.ok else result.category, message=result.error or '授权成功', phone_status=result.phone_status)
+                finish_stage(row)
                 item = items[index - 1]
                 if result.ok and result.account:
                     item.oauth_account = result.account
@@ -285,6 +337,7 @@ class Engine:
                     task['accounts'][uid] = result.account
                 self._save(task)
         set_log_callback(log)
+        progress_events.bind(stage)
         recovery = self.root / 'recovery'
         try:
             if kind == 'inspect':
@@ -313,6 +366,10 @@ class Engine:
                 def pool_progress(job):
                     with self.lock:
                         rows[job.uid].update(state=job.state, message=job.message, account_id=job.account_id, refresh_state=job.refresh_state)
+                        if job.state in ('pushing', 'refreshing'):
+                            stage(job.email, 'pushing' if job.state == 'pushing' else 'refresh')
+                        elif job.state not in ('ready', 'relogin'):
+                            finish_stage(rows[job.uid])
                         task['items'] = [asdict(j) for j in jobs]
                         if job.account: task['accounts'][job.uid] = job.account
                         self._save(task)
@@ -377,11 +434,16 @@ class Engine:
             task['message'] = redact_diagnostic(str(exc), tuple(secrets)) if isinstance(exc, ValueError) or hasattr(exc,'category') else f'运行中断（{type(exc).__name__}），已保留任务'
             log(task['message'])
         finally:
+            progress_events.bind(None)
             set_log_callback(None)
             bind(None)
             self.bridge.page = self.bridge.frame = None
             try:
                 with self.lock:
+                    task['finished'] = time.time()
+                    for row in task['rows']:
+                        if row.get('stage_active'):
+                            finish_stage(row)
                     try:
                         self._save(task)
                     except Exception:
@@ -438,9 +500,14 @@ class Engine:
         raise ValueError('查询类型无效')
 
     def _timer(self):
+        maintenance_at = time.monotonic() + 3600
         while not self.closed.wait(1):
             with self.lock:
                 schedule = copy.deepcopy(self.schedule)
+                if time.monotonic() >= maintenance_at:
+                    try: self.tasks.archive_completed()
+                    except Exception: self.warnings = ['历史任务归档失败，原始记录仍保留']
+                    maintenance_at = time.monotonic() + 3600
             if schedule and time.time() >= schedule['next'] and not self.gate.locked():
                 try: self.start('inspect')
                 except Exception:

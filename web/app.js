@@ -26,6 +26,7 @@ let csrf = "",
   frameUrl = null,
   polling = false,
   settingsReady = false;
+let historyOffset = 0;
 const labels = {
   auth: "批量授权",
   phone: "手机接码",
@@ -53,6 +54,8 @@ const states = {
   uncertain: "写入待核对",
   deferred: "已暂缓",
   attention: "需关注",
+  invalid: "格式无效",
+  conflict: "重复待选",
   network: "网络异常",
   server: "服务异常",
   rate_limited: "已限流",
@@ -93,7 +96,15 @@ async function api(path, method = "GET", data, blob = false) {
     }
     throw Error(e.error || "操作失败");
   }
-  return blob ? r.blob() : r.status === 204 ? null : r.json();
+  if (blob) {
+    const body = await r.blob();
+    const header = r.headers.get("Content-Disposition") || "";
+    const encoded = header.match(/filename\*=UTF-8''([^;]+)/i);
+    const plain = header.match(/filename="([^"]+)"/i);
+    body.downloadName = encoded ? decodeURIComponent(encoded[1]) : plain?.[1];
+    return body;
+  }
+  return r.status === 204 ? null : r.json();
 }
 function notify(message, error = false) {
   const node = $("#toast");
@@ -446,6 +457,7 @@ async function save() {
   }
 }
 async function navigate(next) {
+  if (current?.fingerprint) current.importSelection = [...selected];
   if (settingsReady && ["auth", "phone", "pool"].includes(page)) {
     drafts[page] = $("#account-input").value;
     Object.assign(configs[page], collect());
@@ -454,6 +466,7 @@ async function navigate(next) {
   page = next;
   current = taskByPage[page] || null;
   selected.clear();
+  if (current?.fingerprint) selected = new Set(current.importSelection || current.rows.filter((r) => r.default_selected).map((r) => r.uid));
   $$("[data-page]").forEach((b) =>
     b.classList.toggle("active", b.dataset.page === page),
   );
@@ -506,6 +519,8 @@ function renderTask() {
   ).length;
   $("#stat-pending").textContent = rows.filter((r) => pending(r.state)).length;
   $("#run-status").textContent = t?.message || "";
+  $("#import-notices").textContent = (t?.importErrors || []).join("\n");
+  $("#import-notices").hidden = !t?.importErrors?.length;
   $("#start").disabled = Boolean(active);
   $("#stop").disabled = !active;
   const searchable = $("#result-search").value.toLowerCase(),
@@ -525,7 +540,7 @@ function renderTask() {
   $("#result-rows").innerHTML = shown
     .map(
       (r) =>
-        `<tr><td><input type="checkbox" data-row="${esc(r.uid)}" ${selected.has(r.uid) ? "checked" : ""}></td><td>${esc(r.email)}</td><td class="${good(r.state) ? "success" : pending(r.state) ? "" : "error"}">${esc(states[r.state] || r.state)}</td><td>${esc(r.account_id || "—")}</td><td>${esc(r.message)}</td></tr>`,
+        `<tr><td><input type="checkbox" data-row="${esc(r.uid)}" ${r.selectable === false ? "disabled" : ""} ${selected.has(r.uid) ? "checked" : ""}></td><td>${esc(r.email)}${r.line ? `<small class="hint">第 ${r.line} 行</small>` : ""}</td><td class="${good(r.state) ? "success" : pending(r.state) ? "" : "error"}">${esc(r.stage_active ? "处理中" : states[r.state] || r.state)}</td><td>${esc(r.account_id || "—")}</td><td>${esc(r.message)}${renderSteps(r)}</td></tr>`,
     )
     .join("");
   $("#result-empty").hidden = Boolean(rows.length);
@@ -542,6 +557,11 @@ function renderTask() {
     : "0%";
   for (const id of ["retry", "retry-selected", "defer"])
     $("#" + id).disabled = Boolean(active) || !t?.id;
+}
+function renderSteps(row) {
+  if (!row.steps?.length) return "";
+  return `<div class="step-trail">${row.steps.map((s) =>
+    `<span class="step-chip ${esc(s.status)}">${esc(s.label)}${s.status === "active" ? ` · ${row.stage_seconds || 0}s` : ""}</span>`).join("")}</div>`;
 }
 async function poll() {
   if (polling || !csrf) return;
@@ -598,15 +618,28 @@ async function poll() {
   }
 }
 async function history() {
-  const list = await api("/tasks");
+  const archived = $("#history-filter").value === "archived";
+  const result = await api(`/history?offset=${historyOffset}&limit=25&archived=${archived}`);
+  if (!result.rows.length && historyOffset > 0) {
+    historyOffset = Math.max(0, historyOffset - 25);
+    return history();
+  }
+  const list = result.rows;
+  $("#history-count").textContent = `${result.total} 个任务 · 第 ${Math.floor(historyOffset / 25) + 1} 页`;
+  $("#history-prev").disabled = historyOffset === 0;
+  $("#history-next").disabled = historyOffset + 25 >= result.total;
   $("#history-list").innerHTML = list.length
     ? list
         .map(
           (t) =>
-            `<div class="history-row"><div><b>${labels[t.kind]} · ${new Date(t.created * 1000).toLocaleString()}</b><small>${esc(t.message)}</small></div><span class="badge">${esc(t.status)}</span><button data-history="${t.id}" class="ghost">打开 →</button></div>`,
+            `<div class="history-row"><div><b>${labels[t.kind]} · ${new Date(t.created * 1000).toLocaleString()}</b><small>${esc(t.message)}</small></div><span class="badge">${esc(t.status)}</span><button data-history="${esc(t.id)}" class="ghost">打开 →</button>${t.archive_safe || archived ? `<button data-archive="${esc(t.id)}" class="ghost">${archived ? "恢复列表" : "归档"}</button>` : ""}</div>`,
         )
         .join("")
     : '<div class="empty">还没有处理任务</div>';
+  $$("[data-archive]").forEach((b) => b.onclick = act(async () => {
+    await api(`/tasks/${b.dataset.archive}/archive`, "POST", {archived: !archived});
+    await history();
+  }));
   $$("[data-history]").forEach(
     (b) =>
       (b.onclick = act(async () => {
@@ -696,7 +729,7 @@ async function download(path, method = "GET", data, name = "accounts.json") {
   const url = URL.createObjectURL(blob),
     a = document.createElement("a");
   a.href = url;
-  a.download = name;
+  a.download = blob.downloadName || name;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
@@ -736,11 +769,12 @@ async function readFiles(event) {
   for (const [i, file] of files.entries()) {
     try {
       const text = (await file.text()).replace(/^\uFEFF/, "");
-      await api(
-        fileTarget === "convert" ? "/convert" : "/preview/" + page,
+      const check = await api(
+        fileTarget === "convert" ? "/convert" : "/import-preview/" + page,
         "POST",
         { text },
       );
+      if (check.errors?.length) throw Error(check.errors.join("；"));
       chunks.push(text);
     } catch (e) {
       errors.push(`第 ${i + 1} 个文件：${e.message}`);
@@ -795,21 +829,36 @@ on("#save-settings", async () => {
   await save();
   notify("设置已加密保存");
 });
-on("#recognize", async () => {
-  const rows = await api("/preview/" + page, "POST", {
-    text: $("#account-input").value,
+async function recognize() {
+  const input = $("#account-input").value;
+  const report = await api("/import-preview/" + page, "POST", {
+    text: input,
   });
+  selected = new Set(report.rows.filter((r) => r.default_selected).map((r) => r.uid));
   current = {
-    rows: rows.map((r, i) => ({ ...r, uid: String(i), state: "ready" })),
-    message: "识别完成，确认设置后开始",
+    rows: report.rows, importText: input, fingerprint: report.fingerprint, importErrors: report.errors,
+    message: "识别完成；勾选需要处理的有效记录，重复身份只选一条",
   };
+  taskByPage[page] = current;
   renderTask();
-});
+  return report;
+}
+on("#recognize", recognize);
 on("#start", async () => {
+  if (!current?.fingerprint || current.importText !== $("#account-input").value) {
+    const report = await recognize();
+    if (report.errors.length || report.rows.some((r) => r.state !== "ready")) {
+      notify("请先检查识别结果，勾选有效账号后再次开始", true);
+      return;
+    }
+  }
+  if (current.importErrors?.length) throw Error(current.importErrors.join("；"));
+  if (!selected.size) throw Error("请先勾选需要处理的账号");
   await save();
   const task = await api("/tasks", "POST", {
     kind: page,
     text: $("#account-input").value,
+    import_selected: [...selected], fingerprint: current.fingerprint,
   });
   current = task;
   taskByPage[page] = task;
@@ -870,7 +919,7 @@ on("#defer", async () => {
 $("#result-search").oninput = renderTask;
 $("#result-state").onchange = renderTask;
 $("#select-all").onchange = (e) => {
-  $$("[data-row]").forEach((n) => {
+  $$("[data-row]:not(:disabled)").forEach((n) => {
     n.checked = e.target.checked;
     n.checked ? selected.add(n.dataset.row) : selected.delete(n.dataset.row);
   });
@@ -895,11 +944,12 @@ for (const target of ["pool", "phone"])
     drafts[target] = result.text;
     await navigate(target);
   });
-for (const target of ["sub2", "cpa"])
+for (const target of ["sub2", "sub2-single", "cpa"])
   on("#export-" + target, async () => {
     if (!current?.id) throw Error("没有任务可导出");
+    const scope = selected.size ? "&selected=" + encodeURIComponent([...selected].join(",")) : "";
     const check = await api(
-      "/tasks/" + current.id + "/export-warnings?target=" + target,
+      "/tasks/" + current.id + "/export-warnings?target=" + target + scope,
     );
     if (
       check.warnings.length &&
@@ -907,7 +957,7 @@ for (const target of ["sub2", "cpa"])
     )
       return;
     await download(
-      "/tasks/" + current.id + "/export?target=" + target,
+      "/tasks/" + current.id + "/export?target=" + target + scope,
       "GET",
       undefined,
       target === "cpa" ? "cpa-accounts.zip" : "accounts.json",
@@ -971,6 +1021,9 @@ on("#convert-to-pool", async () => {
   await navigate("pool");
 });
 on("#history-refresh", history);
+on("#history-prev", async () => { historyOffset = Math.max(0, historyOffset - 25); await history(); });
+on("#history-next", async () => { historyOffset += 25; await history(); });
+$("#history-filter").onchange = act(async () => { historyOffset = 0; await history(); });
 on("#browser-open", async () => {
   $("#browser-dialog").showModal();
   await refreshFrame();
