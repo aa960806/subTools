@@ -38,6 +38,9 @@ def main():
                 page=browser.new_page()
                 page.set_content('<title>SubTools smoke</title><p>offline fixture</p>')
                 assert page.title()=='SubTools smoke'
+                # A freshly created Xvfb window may not have a compositor frame
+                # yet even though set_content has finished loading the DOM.
+                page.evaluate('() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))')
                 assert page.screenshot(type='jpeg')[:2]==b'\xff\xd8'
                 browser.close()
         assert normalize_price_options({'38':{'dr':{'cost':'0.03','count':10}}},{},'dr')[0]['country']=='38'

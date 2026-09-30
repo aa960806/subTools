@@ -15,6 +15,8 @@ from account_inputs import AccountInput, load_accounts, login_mapping
 from browser_bridge import BrowserBridge, StopEvent, bind, detach
 from human_pacing import human_settings_from_options
 from oauth_refresh import run_refresh_first
+from login_interaction import LoginInteraction
+from protocol_login import run_batch_protocol
 from openai_reauth import run_batch_reauth, set_log_callback, redact_diagnostic
 from phone_flow import parse_phone_jobs, run_batch_phone_verify
 from phone_network import resolve_phone_proxy
@@ -33,7 +35,7 @@ import progress_events
 
 DEFAULTS = {
     'auth': {'network_mode': 'direct', 'proxy': '', 'proxy_scheme': 'http', 'timeout': 180,
-             'show_browser': False, 'human_pacing': True, 'human_scale': 1.0},
+             'show_browser': False, 'human_pacing': True, 'human_scale': 1.0, 'login_method': 'browser'},
     'phone': {'api_key': '', 'network_mode': 'direct', 'proxy': '', 'proxy_scheme': 'http',
               'country': '38', 'fallback_countries': [], 'max_reuse': 3, 'min_price': '', 'max_price': '0.06',
               'sms_timeout': 180, 'timeout': 300, 'sms_poll_interval': 5, 'auto_retry_count': 2,
@@ -41,7 +43,7 @@ DEFAULTS = {
               'human_pacing': True, 'human_scale': 1.0},
     'pool': {'site': '', 'auth_kind': 'api_key', 'credential': '', 'group_ids': [], 'priority': 50,
              'concurrency': 3, 'model_mode': 'preserve', 'model_choices': {}, 'scheduling_mode': 'override',
-             'proxy_id': None, 'load_factor': None, 'timeout': 180, 'show_browser': False},
+             'proxy_id': None, 'load_factor': None, 'timeout': 180, 'show_browser': False, 'login_method': 'browser'},
 }
 SECRET_FIELDS = {'auth': ('proxy',), 'phone': ('api_key', 'proxy'), 'pool': ('credential',)}
 
@@ -136,6 +138,7 @@ class Engine:
         self.active = None
         self.worker = None
         self.bridge = BrowserBridge()
+        self.interaction = LoginInteraction()
         self.stop = StopEvent(self.bridge)
         self.closed = threading.Event()
         self.schedule = None
@@ -169,6 +172,8 @@ class Engine:
                     raise ValueError(f'{key} 必须是布尔值')
                 if isinstance(default, (dict, list, str)) and not isinstance(value[key], type(default)):
                     raise ValueError(f'{key} 格式不正确')
+            if value.get('login_method', 'browser') not in ('browser', 'protocol'):
+                raise ValueError('登录方式须为浏览器或协议')
             self.store.write(f'config/{kind}.json', value)
             if kind == 'pool' and any(value[k] != previous[k] for k in ('site', 'auth_kind', 'credential', 'group_ids')):
                 self.schedule = None
@@ -187,6 +192,8 @@ class Engine:
         with self.lock:
             task = self.get(task_id)
             result = copy.deepcopy({k: task.get(k) for k in ('id', 'kind', 'status', 'created', 'message', 'rows', 'logs', 'report', 'warnings')})
+            result['login_method'] = task.get('config', {}).get(task['kind'], {}).get('login_method', 'browser')
+            result['login_prompt'] = self.interaction.snapshot() if self.active == task_id else None
             for row in result.get('rows', []):
                 end = time.time() if row.get('stage_active') else row.get('stage_finished', row.get('stage_started', 0))
                 row['stage_seconds'] = max(0, int(end - row.get('stage_started', end)))
@@ -227,6 +234,8 @@ class Engine:
         try:
             configs = {k:self.config(k) for k in DEFAULTS}
             config = configs['pool' if kind == 'inspect' else kind]
+            if config.get('login_method', 'browser') not in ('browser', 'protocol'):
+                raise ValueError('登录方式须为浏览器或协议')
             if kind in ('pool', 'inspect'):
                 pool_settings(config, reading=kind == 'inspect').validate(require_groups=kind == 'pool')
             if kind != 'inspect':
@@ -255,7 +264,7 @@ class Engine:
                           and r['state'] not in ('success','created','updated','deferred')]
                 if kind != 'inspect' and not chosen:
                     raise ValueError('没有可处理账号；成功或暂缓账号不会重复执行')
-                if previous and kind != 'inspect' and (relogin or any(r['uid'] in chosen and r['state']=='needs_interaction' for r in task['rows'])):
+                if previous and kind != 'inspect' and config.get('login_method', 'browser') == 'browser' and (relogin or any(r['uid'] in chosen and r['state']=='needs_interaction' for r in task['rows'])):
                     config['show_browser'] = True
                 for row in task['rows']:
                     if row['uid'] in chosen:
@@ -266,7 +275,8 @@ class Engine:
                 self._save(task)
                 self.active = task['id']
                 self.bridge = BrowserBridge()
-                self.bridge.enabled = kind != 'inspect' and config.get('show_browser', False)
+                self.interaction = LoginInteraction()
+                self.bridge.enabled = kind != 'inspect' and config.get('login_method', 'browser') == 'browser' and config.get('show_browser', False)
                 self.stop = StopEvent(self.bridge)
             self.worker = threading.Thread(target=self._run, args=(task, chosen, relogin), daemon=True)
             self.worker.start()
@@ -376,6 +386,8 @@ class Engine:
                     log(f'{job.email}：{job.message}')
                 pacing = human_settings_from_options(pacing_options(configs['auth']))
                 def authorize(*args, **kwargs):
+                    if config['login_method'] == 'protocol':
+                        return run_batch_protocol(*args, **kwargs, human=pacing, prompt=self.interaction.request)
                     return run_batch_reauth(*args, **kwargs, human=pacing)
                 run_pool_push(selected_jobs, pool_settings(config), stop=self.stop, on_progress=pool_progress,
                     timeout=int(config['timeout']), proxy=proxy_for(configs['auth']), headless=not config['show_browser'],
@@ -411,6 +423,8 @@ class Engine:
                         result.account = merged
                         return result
                     def guarded_authorize(batch, **opts):
+                        if config['login_method'] == 'protocol':
+                            return run_batch_protocol(batch, **opts, result_transform=verify_result, prompt=self.interaction.request)
                         return run_batch_reauth(batch, **opts, result_transform=verify_result)
                     def runner(batch, **opts):
                         return run_refresh_first(batch, authorize=guarded_authorize, **opts)
@@ -434,6 +448,7 @@ class Engine:
             task['message'] = redact_diagnostic(str(exc), tuple(secrets)) if isinstance(exc, ValueError) or hasattr(exc,'category') else f'运行中断（{type(exc).__name__}），已保留任务'
             log(task['message'])
         finally:
+            self.interaction.clear()
             progress_events.bind(None)
             set_log_callback(None)
             detach()

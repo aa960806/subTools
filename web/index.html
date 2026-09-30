@@ -91,6 +91,14 @@
                   ><span id="run-status" class="hint"></span>
                 </div>
               </article>
+              <form id="login-input-card" class="card" hidden autocomplete="off">
+                <h2 id="login-input-title">等待登录输入</h2>
+                <p class="hint">仅用于当前登录步骤，提交后清空。等待计入账号超时，可随时停止任务。</p>
+                <div class="actions">
+                  <input id="login-input-value" type="password" autocomplete="off" required aria-label="登录输入">
+                  <button id="login-input-submit" class="primary">提交并继续</button>
+                </div>
+              </form>
               <div class="stats">
                 <div>
                   <small>成功</small

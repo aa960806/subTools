@@ -814,3 +814,5 @@ dialog .actions input {
 .step-chip.active { color: #b7f5d8; border-color: #449b75; background: #20382e; }
 .step-chip.attention { color: #f3b5ac; border-color: #764c48; }
 td > small { display: block; }
+/* Task-scoped protocol input follows the input card without nesting it. */
+#login-input-card { margin-top: 16px; }

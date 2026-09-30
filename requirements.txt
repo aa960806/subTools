@@ -1,6 +1,7 @@
 playwright==1.60.0
 pyotp>=2.9.0
 httpx[socks]>=0.27.0
+curl_cffi>=0.15,<0.17
 phonenumbers>=8.13.0
 fastapi>=0.115,<1
 uvicorn>=0.30,<1

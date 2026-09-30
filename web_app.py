@@ -220,6 +220,16 @@ def create_app(data_dir=None, password=None):
         if e.active==task_id: e.stop.set()
         return {'ok':True}
 
+    @app.post('/api/tasks/{task_id}/login-input')
+    async def login_input(task_id:str, request:Request):
+        data = await payload(request)
+        e = app.state.engine
+        with e.lock:
+            if e.active != task_id or e.stop.event.is_set():
+                raise ValueError('此任务已结束或已停止，输入未提交')
+            e.interaction.submit(data.get('prompt_id'), data.get('value'))
+        return {'ok': True}
+
     @app.post('/api/tasks/{task_id}/retry')
     async def retry(task_id:str,request:Request):
         data=await payload(request)

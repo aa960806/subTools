@@ -14,7 +14,9 @@ Revision: `8548397e89bf80e508eda64a87e0d556d43abc84` (v1.7.1; checked against re
 
 `phone_price_catalog.py` adapts the country/price normalization in `src/smsbower.mjs` to Python. `phone_smsbower.py` uses its read-only `getPrices` + `getCountries` discovery approach, while retaining this tool's V3 allocation, budget checks and order lifecycle.
 
-Other additions are local implementations informed by upstream source: structured input fields (`src/console-server.mjs`), selected-account actions (`web/src/main.jsx`), task history and periodic inspection scheduling (`src/console-server.mjs`). They reuse the existing Tk UI, DPAPI journals and Playwright workflow. Upstream Node servers, automatic account repair, plaintext browser checkpoints and protocol-login implementations are not dependencies of this tool.
+`protocol_login.py` ports the ordinary HTTP login state machine, password/email/TOTP steps, session selection and organization-first workspace selection from `src/protocol-login.mjs` (`loginChatgptWeb`, `completeTotpMfaIfNeeded`, `runCodexOauth`, `pickWorkspaceId`, `extractFirstSessionId`). `protocol_transport.py` adapts the curl_cffi session transport approach from `src/tls_transport.py`. These are Python adaptations, not the upstream Node service. SubTools retains its own PKCE/state checks, token identity validation, explicit refresh-failure decisions, encrypted task storage and export routines. It does not incorporate upstream challenge solvers, profile probing, automatic account repair, SMS binding or plaintext browser checkpoints.
+
+Other additions are local implementations informed by upstream source: structured input fields (`src/console-server.mjs`), selected-account actions (`web/src/main.jsx`), task history and periodic inspection scheduling (`src/console-server.mjs`). The current web server uses the existing OAuth, SMS and identity-matching engines. The downloaded reference checkout is not a runtime dependency.
 
 MIT License
 

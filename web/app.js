@@ -29,6 +29,7 @@ let csrf = "",
   polling = false,
   settingsReady = false;
 let historyOffset = 0;
+let loginPromptKey = null;
 const labels = {
   auth: "批量授权",
   phone: "手机接码",
@@ -132,6 +133,7 @@ function showLogin() {
   drafts = {};
   taskByPage = {};
   current = null;
+  renderLoginPrompt();
   selected.clear();
   $("#account-input").value = "";
   $("#convert-input").value = "";
@@ -168,8 +170,16 @@ function network(v) {
     ["socks5", "SOCKS5"],
   ])}${secret("proxy", "代理地址", v)}<p class="hint">系统代理读取服务器配置；不读取访问网页这台电脑的代理。</p>`;
 }
+function loginSettings(v) {
+  return `${select("login_method", "登录方式", v, [["browser", "浏览器（默认）"], ["protocol", "协议（实验性）"]])}<p class="hint">协议方式无需浏览器画面；缺少密码或验证码时在本页输入。遇到安全校验需手动选择浏览器后重试。</p>`;
+}
+function updateLoginSettings() {
+  const protocol = $("[data-field=login_method]")?.value === "protocol";
+  const browser = $("[data-field=show_browser]");
+  if (browser) { browser.disabled = protocol; browser.closest("label").hidden = protocol; }
+}
 function running(v) {
-  return `<h3>运行设置</h3>${input("timeout", "每账号处理超时（秒）", v, "number")}${check("show_browser", "显示浏览器（网页内查看与操作）", v)}${check("human_pacing", "启用步骤等待", v)}${input("human_scale", "等待时间倍数", v, "number")}`;
+  return `<h3>运行设置</h3>${page === "auth" ? loginSettings(v) : ""}${input("timeout", "每账号处理超时（秒）", v, "number")}${check("show_browser", "显示浏览器（网页内查看与操作）", v)}${check("human_pacing", "启用步骤等待", v)}${input("human_scale", "等待时间倍数", v, "number")}`;
 }
 function renderSettings() {
   if (!["auth", "phone", "pool"].includes(page)) return;
@@ -208,7 +218,7 @@ function renderSettings() {
         ["override", "使用本次优先级与并发"],
         ["preserve", "保留已有 / 输入配置"],
       ],
-    )}${select("proxy_id", "后台代理（模型请求出口）", v, [["", "保留后台代理"], ["0", "直连 / 清除绑定"], ...(v.proxy_id > 0 && !proxies.some((p) => p.id === v.proxy_id) ? [[String(v.proxy_id), `已保存代理 #${v.proxy_id}（连接后核对）`]] : []), ...proxies.map((p) => [String(p.id), p.name])])}${input("load_factor", "负载系数（留空保留，0 默认）", v, "number")}</div><div data-settings-panel="login" hidden><h3>服务器授权登录</h3><p class="hint">有效 token 可直接推送，无需打开浏览器。账号密码输入由服务器浏览器完成 OAuth。</p>${input("timeout", "每账号登录超时（秒）", v, "number")}${check("show_browser", "显示服务器浏览器（网页内查看与操作）", v)}<p class="hint">开始推送后点击「查看登录浏览器」操作服务器画面。登录网络与步骤等待复用「批量授权」设置，使用服务器出口，不会继承你电脑的代理。手机验证跳过并标记待补手机。</p></div><div data-settings-panel="models" hidden><h3>模型白名单</h3>${select(
+    )}${select("proxy_id", "后台代理（模型请求出口）", v, [["", "保留后台代理"], ["0", "直连 / 清除绑定"], ...(v.proxy_id > 0 && !proxies.some((p) => p.id === v.proxy_id) ? [[String(v.proxy_id), `已保存代理 #${v.proxy_id}（连接后核对）`]] : []), ...proxies.map((p) => [String(p.id), p.name])])}${input("load_factor", "负载系数（留空保留，0 默认）", v, "number")}</div><div data-settings-panel="login" hidden></div><div data-settings-panel="models" hidden><h3>模型白名单</h3>${select(
       "model_mode",
       "模型策略",
       v,
@@ -220,6 +230,11 @@ function renderSettings() {
     )}<div class="tools"><button id="model-sources" class="ghost">加载来源账号</button></div><select id="model-source">${sources.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select><button id="model-sync" class="ghost">同步上游支持模型</button><p class="hint">同步后可删除或保留；已删除的模型再次同步时保持删除。</p><input id="model-search" placeholder="搜索模型"><div id="model-rows" class="choices"></div><input id="custom-model" placeholder="自定义模型，多个用逗号分隔"><button id="model-add" class="ghost">添加模型</button></div>`;
   }
   $("#settings-body").innerHTML = html;
+  if (page === "pool") {
+    $("[data-settings-panel=login]").innerHTML = `<h3>服务器授权登录</h3><p class="hint">有效 token 可直接推送；需要重新登录时使用下方方式。</p>${loginSettings(v)}${input("timeout", "每账号登录超时（秒）", v, "number")}${check("show_browser", "显示服务器浏览器（网页内查看与操作）", v)}<p class="hint">登录网络与步骤等待复用「批量授权」设置，使用服务器出口。手机验证跳过并标记待补手机。</p>`;
+  }
+  if ($("[data-field=login_method]")) $("[data-field=login_method]").onchange = updateLoginSettings;
+  updateLoginSettings();
   settingsReady = true;
   $$("[data-eye]").forEach(
     (b) =>
@@ -509,6 +524,8 @@ function tab(name) {
 }
 function renderTask() {
   const t = current;
+  renderLoginPrompt();
+  $("#browser-open").hidden = t?.login_method === "protocol";
   const rows = t?.rows || [];
   $("#count").textContent = `${rows.length} 个账号`;
   $("#stat-success").textContent = rows.filter((r) => good(r.state)).length;
@@ -555,6 +572,23 @@ function renderTask() {
     : "0%";
   for (const id of ["retry", "retry-selected", "defer"])
     $("#" + id).disabled = Boolean(active) || !t?.id;
+}
+function renderLoginPrompt() {
+  const p = current?.login_prompt;
+  const key = p ? `${current.id}:${p.id}` : null;
+  const box = $("#login-input-card"), field = $("#login-input-value");
+  box.hidden = !p;
+  if (key === loginPromptKey) return;
+  loginPromptKey = key;
+  field.value = "";
+  $("#login-input-submit").disabled = false;
+  if (p) {
+    $("#login-input-title").textContent = `${p.email} · ${p.label}`;
+    field.type = "password";
+    field.inputMode = p.kind === "password" ? "text" : "numeric";
+    field.maxLength = p.kind === "password" ? 4096 : 6;
+    field.setAttribute("aria-label", p.label);
+  }
 }
 function renderSteps(row) {
   if (!row.steps?.length) return "";
@@ -885,7 +919,23 @@ on("#start", async () => {
   active = task.id;
   selected.clear();
   renderTask();
-  if (configs[page].show_browser) notify("可点击“查看登录浏览器”进行手动操作");
+  if (configs[page].login_method !== "protocol" && configs[page].show_browser) notify("可点击“查看登录浏览器”进行手动操作");
+});
+$("#login-input-card").onsubmit = act(async (event) => {
+  event.preventDefault();
+  const prompt = current?.login_prompt, taskId = current?.id;
+  if (!prompt || !taskId) throw Error("当前没有等待输入的登录步骤");
+  const field = $("#login-input-value"), button = $("#login-input-submit");
+  const value = field.value;
+  field.value = "";
+  button.disabled = true;
+  try {
+    await api(`/tasks/${taskId}/login-input`, "POST", {prompt_id: prompt.id, value});
+    notify("已提交，等待登录结果");
+  } catch (e) {
+    button.disabled = false;
+    throw e;
+  }
 });
 on("#stop", async () => {
   if (active) await api("/tasks/" + active + "/stop", "POST", {});

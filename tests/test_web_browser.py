@@ -119,6 +119,57 @@ def test_browser_handoff_commands_and_cancellation(browser):
     assert bridge.page is None and bridge.frame is None
 
 
+def test_protocol_prompt_and_explicit_browser_retry(browser, site, monkeypatch):
+    from openai_reauth import ReauthResult
+    attempts = []
+    def protocol(items, **options):
+        attempts.append(1)
+        if len(attempts) == 1:
+            value = options['prompt'](items[0].email, 'email_code', deadline=time.monotonic()+20,
+                                      should_stop=options['should_stop'])
+            assert value == '123456'
+            return fake_login(items, **options)
+        result = ReauthResult(items[0].email, False, category='needs_interaction', error='安全校验，请选择浏览器重试')
+        options['on_progress'](1, 1, result)
+        return [result]
+    monkeypatch.setattr('server_engine.run_batch_protocol', protocol)
+    page = browser.new_page(viewport={'width':1440,'height':1050})
+    errors = []
+    page.on('pageerror', lambda e: errors.append(str(e)))
+    page.goto(site)
+    page.locator('#login-password').fill('fixture-password-for-web')
+    page.locator('#login-form button').click()
+    page.locator('[data-field=login_method]').select_option('protocol')
+    expect(page.locator('[data-field=show_browser]')).to_be_hidden()
+    page.locator('#account-input').fill('fixture@example.com----fixture-pass')
+    page.locator('#start').click()
+    page.locator('#login-input-card').wait_for(state='visible')
+    page.locator('#login-input-value').fill('123456')
+    page.screenshot(path='.browser-smoke/protocol-input.png', full_page=True)
+    page.locator('#login-input-submit').click()
+    expect(page.locator('#stat-success')).to_have_text('1')
+    expect(page.locator('#login-input-card')).to_be_hidden()
+    assert page.locator('#login-input-value').input_value() == ''
+    expect(page.locator('#browser-open')).to_be_hidden()
+    page.locator('#start').click()
+    expect(page.locator('#stat-failed')).to_have_text('1')
+    assert len(attempts) == 2  # No automatic browser fallback.
+    page.locator('[data-field=login_method]').select_option('browser')
+    expect(page.locator('[data-field=show_browser]')).to_be_visible()
+    page.locator('#retry').click()
+    expect(page.locator('#stat-success')).to_have_text('1')
+    expect(page.locator('#browser-open')).to_be_visible()
+    page.locator('[data-page=pool]').click()
+    page.locator('[data-settings-tab=login]').click()
+    expect(page.locator('[data-field=login_method]')).to_have_value('browser')
+    page.locator('[data-field=login_method]').select_option('protocol')
+    page.locator('[data-page=phone]').click()
+    assert page.locator('[data-field=login_method]').count() == 0
+    expect(page.locator('[data-field=show_browser]')).to_be_visible()
+    assert not errors
+    page.close()
+
+
 def test_import_selection_archive_and_single_download(browser, site, monkeypatch):
     import progress_events
     def observed_login(items, **options):
