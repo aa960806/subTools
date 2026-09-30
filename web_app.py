@@ -295,15 +295,16 @@ def create_app(data_dir=None, password=None):
     @app.get('/api/browser/frame')
     def frame():
         e=app.state.engine
-        if not e.active or not e.bridge.enabled or not e.bridge.frame:
+        frame, generation = e.bridge.snapshot()
+        if not e.active or e.stop.event.is_set() or not e.bridge.enabled or not frame:
             return Response(status_code=204)
-        return Response(e.bridge.frame,media_type='image/jpeg')
+        return Response(frame,media_type='image/jpeg',headers={'X-Browser-Generation':generation})
 
     @app.post('/api/browser/input')
     async def browser_input(request:Request):
         data=await payload(request)
         e=app.state.engine
-        if not e.active or not e.bridge.enabled: raise ValueError('当前任务没有可操作的浏览器')
+        if not e.active or e.stop.event.is_set() or not e.bridge.enabled: raise ValueError('当前任务没有可操作的浏览器')
         action=data.get('action');command={'action':action}
         if action=='click':
             command.update(x=integer(data.get('x'),'横坐标',0,1279),y=integer(data.get('y'),'纵坐标',0,899))
@@ -315,8 +316,7 @@ def create_app(data_dir=None, password=None):
             command['key']=data['key']
         elif action=='scroll': command['delta']=600 if data.get('delta',0)>0 else -600
         else: raise ValueError('浏览器操作无效')
-        try:e.bridge.commands.put_nowait(command)
-        except Exception:raise ValueError('操作过快，请稍候') from None
+        e.bridge.submit(data.get('generation'), command)
         return {'ok':True}
 
     @app.get('/api/legacy')

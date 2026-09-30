@@ -105,12 +105,13 @@ def test_browser_handoff_commands_and_cancellation(browser):
     bridge=BrowserBridge();bridge.enabled=True
     bind(bridge);attach(page)
     stop=StopEvent(bridge);stop.owner=threading.get_ident()
-    bridge.commands.put({'action':'click','x':60,'y':40})
-    bridge.commands.put({'action':'text','text':'fixture-manual-input'})
+    assert not stop.is_set()
+    bridge.submit(bridge.generation, {'action':'click','x':60,'y':40})
+    bridge.submit(bridge.generation, {'action':'text','text':'fixture-manual-input'})
     assert not stop.is_set()
     assert page.locator('input').input_value()=='fixture-manual-input'
     assert bridge.frame[:2]==b'\xff\xd8'
-    bridge.commands.put({'action':'click','x':50,'y':100})
+    bridge.submit(bridge.generation, {'action':'click','x':50,'y':100})
     stop.is_set()
     assert page.title()=='clicked'
     stop.set();assert stop.is_set()

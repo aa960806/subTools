@@ -93,4 +93,4 @@ class PoolJournal:
                 raise ValueError
             return config, jobs
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            raise PoolError("无法恢复此任务：文件损坏、格式不支持，或不属于当前 Windows 用户", category="storage") from None
+            raise PoolError("无法恢复此任务：文件损坏、格式不支持或加密密钥不匹配；旧 DPAPI 文件需在原 Windows 用户下迁移", category="storage") from None

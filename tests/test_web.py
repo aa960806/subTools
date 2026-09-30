@@ -327,3 +327,37 @@ def test_browser_queue_does_not_replay_into_next_account():
         assert bridge.commands.empty()
     finally:
         detach();bind(None)
+
+
+def test_browser_handoff_requires_current_frame_and_rejects_stopped_task(client):
+    from browser_bridge import bind, attach, detach
+    login(client)
+    e = client.app.state.engine
+    e.active = 'fixture-handoff'
+    e.bridge.enabled = True
+    bind(e.bridge)
+    try:
+        attach(object())
+        assert client.post('/api/browser/input', json={'action':'text','text':'x'}).status_code == 400
+        e.bridge.frame = b'fixture-frame-one'
+        first = client.get('/api/browser/frame')
+        generation = first.headers['X-Browser-Generation']
+        command = {'action':'text', 'text':'previous-account-secret', 'generation':generation}
+        assert client.post('/api/browser/input', json=command).status_code == 200
+        detach()
+        attach(object())
+        assert client.get('/api/browser/frame').status_code == 204
+        e.bridge.frame = b'fixture-frame-two'
+        assert client.post('/api/browser/input', json=command).status_code == 400
+        assert e.bridge.commands.empty()
+        second = client.get('/api/browser/frame')
+        command['generation'] = second.headers['X-Browser-Generation']
+        assert command['generation'] != generation
+        assert client.post('/api/browser/input', json=command).status_code == 200
+        e.stop.set()
+        assert e.bridge.commands.empty()
+        assert client.get('/api/browser/frame').status_code == 204
+        assert client.post('/api/browser/input', json=command).status_code == 400
+    finally:
+        detach();bind(None)
+        e.active = None

@@ -12,7 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from account_inputs import AccountInput, load_accounts, login_mapping
-from browser_bridge import BrowserBridge, StopEvent, bind
+from browser_bridge import BrowserBridge, StopEvent, bind, detach
 from human_pacing import human_settings_from_options
 from oauth_refresh import run_refresh_first
 from openai_reauth import run_batch_reauth, set_log_callback, redact_diagnostic
@@ -436,8 +436,8 @@ class Engine:
         finally:
             progress_events.bind(None)
             set_log_callback(None)
+            detach()
             bind(None)
-            self.bridge.page = self.bridge.frame = None
             try:
                 with self.lock:
                     task['finished'] = time.time()

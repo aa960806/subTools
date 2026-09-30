@@ -24,6 +24,8 @@ let csrf = "",
   quotes = [],
   timer = null,
   frameUrl = null,
+  frameGeneration = null,
+  frameRequest = 0,
   polling = false,
   settingsReady = false;
 let historyOffset = 0;
@@ -136,11 +138,7 @@ function showLogin() {
   $("#convert-preview").textContent = "结果将在此显示";
   $("#settings-body").replaceChildren();
   $("#browser-text").value = "";
-  $("#browser-frame").removeAttribute("src");
-  if (frameUrl) {
-    URL.revokeObjectURL(frameUrl);
-    frameUrl = null;
-  }
+  clearBrowserFrame();
   $("#browser-dialog").close();
   $("#login").hidden = false;
   $("#app").hidden = true;
@@ -194,7 +192,7 @@ function renderSettings() {
       )}<div class="two-cols">${input("min_price", "最低单价", v)}${input("max_price", "最高单价", v)}</div>${check("auto_price_match", "限价内自动匹配最低报价", v)}<div class="two-cols">${input("max_reuse", "单号绑定上限", v, "number")}${input("sms_timeout", "收短信超时（秒）", v, "number")}${input("auto_retry_count", "小重试次数", v, "number")}${input("country_retry_count", "大重试换国次数", v, "number")}${input("sms_poll_interval", "短信轮询（秒）", v, "number")}</div><p class="hint">每国首次尝试 + 小重试；换国按下方顺序，预算用尽熔断。</p><label>添加自定义备用国家<select id="fallback-choice">${countries.map((c) => `<option value="${c.code}">${esc(c.label)}</option>`).join("")}</select></label><button id="fallback-add" class="ghost">＋ 添加备用国家</button><div id="fallback-list"></div><h3>国家比价</h3><button id="price-catalog" class="ghost">读取各国价格与库存</button><input id="price-search" placeholder="国家名、英文、拼音或代码"><select id="price-sort"><option value="price">按价格</option><option value="stock">按库存</option><option value="name">国家 A–Z</option></select><div id="price-rows" class="quotes"></div>${running(v)}`;
   }
   if (page === "pool") {
-    html = `<div class="segments"><button data-settings-tab="connection" class="selected">连接</button><button data-settings-tab="groups">分组</button><button data-settings-tab="models">模型</button></div><div data-settings-panel="connection"><h3>sub2api 后台</h3>${input("site", "站点地址", v)}${select(
+    html = `<div class="segments"><button data-settings-tab="connection" class="selected">连接</button><button data-settings-tab="groups">分组</button><button data-settings-tab="models">模型</button><button data-settings-tab="login">登录</button></div><div data-settings-panel="connection"><h3>sub2api 后台</h3>${input("site", "站点地址", v)}${select(
       "auth_kind",
       "管理员凭据类型",
       v,
@@ -210,7 +208,7 @@ function renderSettings() {
         ["override", "使用本次优先级与并发"],
         ["preserve", "保留已有 / 输入配置"],
       ],
-    )}${select("proxy_id", "后台代理（模型请求出口）", v, [["", "保留后台代理"], ["0", "直连 / 清除绑定"], ...(v.proxy_id > 0 && !proxies.some((p) => p.id === v.proxy_id) ? [[String(v.proxy_id), `已保存代理 #${v.proxy_id}（连接后核对）`]] : []), ...proxies.map((p) => [String(p.id), p.name])])}${input("load_factor", "负载系数（留空保留，0 默认）", v, "number")}<h3>登录设置</h3>${input("timeout", "每账号登录超时（秒）", v, "number")}${check("show_browser", "显示登录浏览器", v)}<p class="hint">登录网络与步骤等待复用「批量授权」设置。手机验证跳过并标记待补手机。</p></div><div data-settings-panel="models" hidden><h3>模型白名单</h3>${select(
+    )}${select("proxy_id", "后台代理（模型请求出口）", v, [["", "保留后台代理"], ["0", "直连 / 清除绑定"], ...(v.proxy_id > 0 && !proxies.some((p) => p.id === v.proxy_id) ? [[String(v.proxy_id), `已保存代理 #${v.proxy_id}（连接后核对）`]] : []), ...proxies.map((p) => [String(p.id), p.name])])}${input("load_factor", "负载系数（留空保留，0 默认）", v, "number")}</div><div data-settings-panel="login" hidden><h3>服务器授权登录</h3><p class="hint">有效 token 可直接推送，无需打开浏览器。账号密码输入由服务器浏览器完成 OAuth。</p>${input("timeout", "每账号登录超时（秒）", v, "number")}${check("show_browser", "显示服务器浏览器（网页内查看与操作）", v)}<p class="hint">开始推送后点击「查看登录浏览器」操作服务器画面。登录网络与步骤等待复用「批量授权」设置，使用服务器出口，不会继承你电脑的代理。手机验证跳过并标记待补手机。</p></div><div data-settings-panel="models" hidden><h3>模型白名单</h3>${select(
       "model_mode",
       "模型策略",
       v,
@@ -711,18 +709,40 @@ async function history() {
       })),
   );
 }
+function clearBrowserFrame() {
+  frameRequest++;
+  frameGeneration = null;
+  $("#browser-text").value = "";
+  $("#browser-frame").removeAttribute("src");
+  if (frameUrl) URL.revokeObjectURL(frameUrl);
+  frameUrl = null;
+  $("#browser-wait").hidden = false;
+}
+async function browserInput(command) {
+  if (!frameGeneration) throw Error("请等待可操作的浏览器画面");
+  return api("/browser/input", "POST", { ...command, generation: frameGeneration });
+}
 async function refreshFrame() {
+  const request = ++frameRequest;
   const r = await fetch("/api/browser/frame", { cache: "no-store" });
-  if (r.status === 204) {
-    $("#browser-wait").hidden = false;
-    return;
-  }
-  if (!r.ok) return;
+  if (request !== frameRequest || !$("#browser-dialog").open) return;
+  if (r.status === 204 || !r.ok) { clearBrowserFrame(); return; }
   const blob = await r.blob();
+  if (request !== frameRequest || !$("#browser-dialog").open) return;
+  const generation = r.headers.get("X-Browser-Generation");
+  if (frameGeneration !== generation) {
+    frameGeneration = null;
+    $("#browser-text").value = "";
+    $("#browser-frame").removeAttribute("src");
+  }
   if (frameUrl) URL.revokeObjectURL(frameUrl);
   frameUrl = URL.createObjectURL(blob);
+  $("#browser-frame").onload = () => {
+    if (request !== frameRequest || !$("#browser-dialog").open) return;
+    frameGeneration = generation;
+    $("#browser-wait").hidden = Boolean(generation);
+  };
   $("#browser-frame").src = frameUrl;
-  $("#browser-wait").hidden = true;
 }
 async function download(path, method = "GET", data, name = "accounts.json") {
   const blob = await api(path, method, data, true);
@@ -1025,16 +1045,22 @@ on("#history-prev", async () => { historyOffset = Math.max(0, historyOffset - 25
 on("#history-next", async () => { historyOffset += 25; await history(); });
 $("#history-filter").onchange = act(async () => { historyOffset = 0; await history(); });
 on("#browser-open", async () => {
+  clearBrowserFrame();
   $("#browser-dialog").showModal();
   await refreshFrame();
 });
 on("#browser-close", () => {
   $("#browser-dialog").close();
   $("#browser-text").value = "";
+  clearBrowserFrame();
+});
+$("#browser-dialog").addEventListener("close", () => {
+  $("#browser-text").value = "";
+  clearBrowserFrame();
 });
 $("#browser-frame").onclick = act(async (event) => {
   const rect = event.target.getBoundingClientRect();
-  await api("/browser/input", "POST", {
+  await browserInput({
     action: "click",
     x: Math.min(
       1279,
@@ -1047,7 +1073,7 @@ $("#browser-frame").onclick = act(async (event) => {
   });
 });
 on("#browser-send", async () => {
-  await api("/browser/input", "POST", {
+  await browserInput({
     action: "text",
     text: $("#browser-text").value,
   });
@@ -1056,14 +1082,14 @@ on("#browser-send", async () => {
 $$("[data-key]").forEach(
   (b) =>
     (b.onclick = act(() =>
-      api("/browser/input", "POST", { action: "key", key: b.dataset.key }),
+      browserInput({ action: "key", key: b.dataset.key }),
     )),
 );
 on("#browser-up", () =>
-  api("/browser/input", "POST", { action: "scroll", delta: -600 }),
+  browserInput({ action: "scroll", delta: -600 }),
 );
 on("#browser-down", () =>
-  api("/browser/input", "POST", { action: "scroll", delta: 600 }),
+  browserInput({ action: "scroll", delta: 600 }),
 );
 (async () => {
   try {
