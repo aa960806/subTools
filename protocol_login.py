@@ -15,6 +15,7 @@ import secrets
 import time
 import uuid
 from datetime import datetime
+from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
@@ -33,6 +34,26 @@ from protocol_transport import CurlTransport
 CHATGPT = 'https://chatgpt.com'
 AUTH = 'https://auth.openai.com'
 ALLOWED_ORIGINS = {CHATGPT, AUTH}
+WEB_SESSION_COOKIE = '__Secure-next-auth.session-token'
+
+
+def page_diagnostic(url, response=None, *, oauth=False):
+    """Describe a step without echoing query tokens, IDs, body or headers."""
+    parsed = urlsplit(url)
+    known_paths = {'/', '/log-in', '/log-in/password', '/email-verification',
+                   '/workspace', '/choose-an-account', '/add-phone', '/phone-verification',
+                   '/about-you', '/oauth/authorize', '/auth/login', '/auth/error',
+                   '/api/auth/callback/openai', '/api/auth/error', '/api/auth/signin'}
+    path = parsed.path if parsed.path in known_paths else '/<未适配路径>'
+    if parsed.path.startswith('/mfa-challenge/'):
+        path = '/mfa-challenge/<id>'
+    origin = parsed.hostname if f'{parsed.scheme}://{parsed.netloc}' in ALLOWED_ORIGINS else '<未知站点>'
+    detail = f'阶段={"Codex OAuth" if oauth else "网页登录"}，页面={origin}{path}'
+    if response is not None:
+        media = response.headers.get('Content-Type', '').split(';')[0].strip().lower()
+        kind = {'application/json': 'JSON', 'text/html': 'HTML', 'text/plain': '文本'}.get(media, '其他')
+        detail += f'，HTTP {response.status_code}，类型={kind}'
+    return detail
 
 
 def continue_url(payload):
@@ -109,6 +130,7 @@ class ProtocolClient:
         self.deadline, self.should_stop = deadline, should_stop
         self.proxy = normalize_proxy(proxy)
         self.requests = 0
+        self.oauth_phase = False
         # This transport owns the explicit proxy; httpx must not create a second
         # proxy transport that would bypass either curl or the test fixture.
         transport = transport or CurlTransport(proxy=self.proxy, deadline=deadline, should_stop=should_stop)
@@ -122,6 +144,16 @@ class ProtocolClient:
     def cookie(self, name, host):
         return next((c.value for c in self.http.cookies.jar if c.name == name
                      and (host == c.domain.lstrip('.') or host.endswith('.' + c.domain.lstrip('.')))), '')
+
+    def has_web_session(self):
+        # Use the request cookie header so domain/path/expiry rules still apply.
+        cookies = SimpleCookie()
+        cookies.load(self.http.build_request('GET', CHATGPT + '/').headers.get('Cookie', ''))
+        if WEB_SESSION_COOKIE in cookies and cookies[WEB_SESSION_COOKIE].value:
+            return True
+        parts = {int(name[len(WEB_SESSION_COOKIE) + 1:]) for name, value in cookies.items()
+                 if re.fullmatch(re.escape(WEB_SESSION_COOKIE) + r'\.[0-9]{1,2}', name) and value.value}
+        return bool(parts) and parts == set(range(max(parts) + 1))
 
     def request(self, method, url, *, referer=None, **options):
         check_running(self.should_stop, self.deadline)
@@ -173,7 +205,8 @@ class ProtocolClient:
         challenge = ('challenge' in response.headers.get('cf-mitigated', '').lower()
                      or bool(re.search(r'<title>\s*(?:Just a moment|Verify you are human)|cf-challenge', content, re.I)))
         if challenge or status == 403 or any(s in code for s in ('sentinel', 'security', 'challenge', 'captcha')) or code == 'invalid_auth_step':
-            raise AuthFlowError('needs_interaction', f'协议登录遇到安全校验（HTTP {status}），请改用浏览器登录；未自动重试或切换网络')
+            raise AuthFlowError('needs_interaction', f'协议登录遇到安全校验（HTTP {status}），请改用浏览器登录；未自动重试或切换网络；'
+                                + page_diagnostic(str(response.url), oauth=self.oauth_phase))
         if status >= 400 or error:
             raise AuthFlowError('failed', f'协议登录请求被拒绝（HTTP {status}），请检查账号或改用浏览器')
         return response
@@ -272,6 +305,22 @@ class ProtocolLogin:
         self.totp_sent = True
         return self.post('/api/accounts/mfa/verify', {'type':'totp', 'id':factor['id'], 'code':code}, referer)
 
+    def can_start_oauth(self, url):
+        """A web landing permits OAuth, but does not prove OAuth success.
+
+        The auth.openai.com login session can already be usable for Codex even
+        without a ChatGPT session cookie. Upstream continueFlow also hands off
+        after the verified login continuation; it does not require that cookie.
+        """
+        parsed = urlsplit(url)
+        if f'{parsed.scheme}://{parsed.netloc}' != CHATGPT:
+            return False
+        first_segment = parsed.path.strip('/').split('/')[0]
+        if first_segment in {'auth', 'api', 'log-in', 'login', 'mfa-challenge',
+                             'email-verification', 'add-phone', 'phone-verification', 'about-you'} or 'error' in parse_qs(parsed.query, keep_blank_values=True):
+            return False
+        return self.client.has_web_session() or self.password_sent or self.email_sent
+
     def advance(self, payload, *, oauth=None):
         for _ in range(16):
             self.check()
@@ -307,14 +356,16 @@ class ProtocolLogin:
                 if oauth:
                     self.selected_workspace = selected
                 continue
+            if page_type not in (None, 'workspace', 'external_url'):
+                raise AuthFlowError('needs_interaction', '协议登录收到未适配的步骤，请改用浏览器；'
+                                    + page_diagnostic(target, oauth=bool(oauth)))
             if not target:
-                raise AuthFlowError('needs_interaction', '协议登录收到未适配的步骤，请改用浏览器')
+                raise AuthFlowError('needs_interaction', '协议登录收到未适配的步骤，请改用浏览器；'
+                                    + page_diagnostic('', oauth=bool(oauth)))
             final, response = self.client.follow(target, session=oauth)
             if oauth and callback_code(final, oauth) is not None:
                 return final
             parsed = urlsplit(final)
-            if not oauth and parsed.scheme + '://' + parsed.netloc == CHATGPT and parsed.path == '/' and self.client.cookie('__Secure-next-auth.session-token', 'chatgpt.com'):
-                return final
             if parsed.path in ('/log-in/password', '/email-verification', '/add-phone', '/phone-verification', '/about-you'):
                 payload = {'continue_url':final}
                 continue
@@ -325,7 +376,11 @@ class ProtocolLogin:
                         continue
                 except ValueError:
                     pass
-            raise AuthFlowError('needs_interaction', '协议登录遇到未适配页面，请改用浏览器完成')
+            if not oauth and self.can_start_oauth(final):
+                log(f'{self.account.email}: 网页登录跳转已结束，继续 Codex OAuth 校验')
+                return final
+            raise AuthFlowError('needs_interaction', '协议登录遇到未适配页面，请改用浏览器完成；'
+                                + page_diagnostic(final, response, oauth=bool(oauth)))
         raise AuthFlowError('needs_interaction', '协议登录步骤未收敛，已停止，请改用浏览器')
 
     def run(self):
@@ -348,16 +403,18 @@ class ProtocolLogin:
                 'screen_hint':'login_or_signup', 'login_hint':self.account.email}),
                 data={'callbackUrl':CHATGPT+'/', 'csrfToken':csrf['csrfToken'], 'json':'true'}, referer=CHATGPT+'/')
             first, _ = self.client.follow(trusted_url(signin.get('url')))
-            if not (first == CHATGPT + '/' and self.client.cookie('__Secure-next-auth.session-token', 'chatgpt.com')):
+            if not self.can_start_oauth(first):
                 self.advance({'continue_url':first})
             session = generate_oauth_session()
+            self.client.oauth_phase = True
             final, response = self.client.follow(session.auth_url, session=session)
             if callback_code(final, session) is None:
                 if urlsplit(final).path in ('/add-phone', '/phone-verification'):
                     raise AuthFlowError('phone_required', '待补手机：协议登录已跳过手机验证，未调用接码服务')
                 session_id = first_session_id(response.text if response is not None else '')
                 if not session_id:
-                    raise AuthFlowError('needs_interaction', 'Codex 会话选择页面无法识别，请改用浏览器')
+                    raise AuthFlowError('needs_interaction', 'Codex 会话选择页面无法识别，请改用浏览器；'
+                                        + page_diagnostic(final, response, oauth=True))
                 payload = self.post('/api/accounts/session/select', {'session_id':session_id}, final)
                 final = self.advance(payload, oauth=session)
             code = callback_code(final, session)

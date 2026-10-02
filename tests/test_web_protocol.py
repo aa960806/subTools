@@ -3,6 +3,7 @@ import json
 import time
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from test_web import data, engine, client, login, finished, fake_login
@@ -64,6 +65,55 @@ def test_pool_protocol_creates_and_updates_same_identity(engine,monkeypatch):
     assert second['rows'][0]['state'] == 'updated'
     assert protocol.call_count == 2 and len(backend.records) == 1
     assert next(iter(backend.records.values()))['load_factor'] == 3
+
+
+@pytest.mark.parametrize('failure', [None, 'identity', 'phone', 'state', 'challenge', 'cancelled'])
+def test_protocol_state_machine_to_pool_without_browser(engine, monkeypatch, failure):
+    from protocol_login import run_batch_protocol
+    from test_protocol_login import LoginSite, tokens, CHATGPT
+    import pool_flow
+    backend, sites = AdminBackend(), []
+    engine.save_config('auth', {'human_pacing':False})
+    engine.save_config('pool', {'site':'https://sub2.test', 'credential':'fixture-key', 'group_ids':[7],
+                               'login_method':'protocol', 'proxy_id':42, 'load_factor':3,
+                               'priority':11, 'concurrency':4})
+    monkeypatch.setattr('server_engine.run_batch_reauth', Mock(side_effect=AssertionError('browser must not run')))
+    def protocol(items, **kwargs):
+        site = LoginSite(phone=failure == 'phone')
+        sites.append(site)
+        # Reproduce the post-MFA landing rejected by the old protocol adapter.
+        site.override['/api/auth/callback/openai'] = httpx.Response(302, headers={'location':CHATGPT + '/'})
+        if failure == 'state':
+            site.callback = lambda:'http://localhost:1455/auth/callback?code=fixture&state=wrong'
+        if failure == 'challenge':
+            site.override['/api/auth/callback/openai'] = httpx.Response(403)
+        if failure == 'cancelled':
+            def stop_before_oauth(request):
+                engine.stop.set()
+                return httpx.Response(200, text='<html>home</html>')
+            site.override['/api/auth/callback/openai'] = stop_before_oauth
+        return run_batch_protocol(items, **kwargs, transport=httpx.MockTransport(site),
+            exchange=lambda *a, **k:tokens(space='wrong-space' if failure == 'identity' else 'space-fixture'))
+    monkeypatch.setattr('server_engine.run_batch_protocol', protocol)
+    monkeypatch.setattr('server_engine.run_pool_push', lambda *a, **kw:pool_flow.run_pool_push(
+        *a, **kw, client_factory=backend.client, refresh=lambda a, **_:a))
+    source = 'fixture@example.com----fixture-pass----JBSWY3DPEHPK3PXP'
+    first = finished(engine, engine.start('pool', source))
+    if failure:
+        assert first['rows'][0]['state'] not in ('created', 'updated', 'success')
+        assert not backend.records
+        assert not any(method in ('POST', 'PUT') for method, *_ in backend.requests)
+        return
+    assert first['rows'][0]['state'] == 'created', first['rows'][0]['message']
+    second = finished(engine, engine.start('pool', source))
+    assert second['rows'][0]['state'] == 'updated' and len(backend.records) == 1
+    record = next(iter(backend.records.values()))
+    assert record['group_ids'] == [7] and record['priority'] == 11 and record['concurrency'] == 4
+    assert record['proxy_id'] == 42 and record['load_factor'] == 3
+    assert record['credentials']['refresh_token'] == 'fixture-rotated'
+    assert record['credentials']['chatgpt_account_id'] == 'space-fixture'
+    assert not engine.bridge.enabled
+    assert all(sum(r.url.path == '/api/accounts/mfa/verify' for r in s.requests) == 1 for s in sites)
 
 
 def wait_prompt(engine, task):
