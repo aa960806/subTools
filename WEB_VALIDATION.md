@@ -1,5 +1,18 @@
 # 网页迁移验证记录
 
+## 自动注册任务边界（2026-10-03）
+
+- 网页新增“自动注册”入口，注册输入独立校验邮箱和邮箱接码地址，使用与现有授权、接码、推池任务相同的单 worker、停止、保存和历史任务生命周期。
+- 注册阶段按邮箱准备、Sentinel、身份、注册、邮箱 OTP、账号创建、会话、凭据探测和收尾记录进度；checkpoint 写入 `data/tasks/<task-id>/registration-checkpoints/`。成功结果删除 checkpoint，取消和未确认结果保留 checkpoint，不自动重放。
+- 默认 `register.driver=disabled`，只做输入校验与安全状态编排；本地 `fixture` 驱动必须同时设置 `SUBTOOLS_REGISTRATION_FIXTURE=1`，只生成合成凭据，不访问外部平台。`playwright` 驱动默认从 `https://chatgpt.com/auth/login` 开始，复用现有浏览器、MailboxClient 和 PKCE/OAuth 身份校验；Microsoft 四段邮箱凭据中的邮箱密码不会作为注册密码使用。
+- Playwright 遇到 CAPTCHA、安全挑战、已有账号、限流、取消或 OAuth/网络结果不明确时停止并保留 checkpoint，不重放副作用请求；需要人工验证时返回 `needs_interaction`。建号状态以 `/api/accounts/create_account` 的明确响应为准，普通“已有账号”页面提示不作为已注册证据。
+- 对照参考项目发现第一阶段 checkpoint 的适配器签名未接收副作用字段，真实运行会立即抛出 `TypeError`；已修复并增加回归。注册网络设置现传入解析后的代理。邮箱验证页在 OTP 输入框出现前和 OTP 提交后各最多允许一次明确的继续操作；生成密码在提交前保存到加密任务，独立 JSON checkpoint 不含密码。
+- 本轮只使用 `mail.txt` 中一条真实邮箱测试。Microsoft Graph 只读收件箱可用，美国系统代理下浏览器成功提交邮箱、密码、邮箱 OTP 和资料；`/api/accounts/create_account` 返回明确成功，故账号已创建。随后 ChatGPT 会话未建立，旧状态机将未知页面误报为“邮箱提交后页面未推进”，未保存成功账号。已将建号后的未知页面转入会话等待，并在超时时保留 `auth_session_pending`；不会对该邮箱重新发起注册。
+- 对该已建账号单独执行 OAuth 登录恢复验收，美国出口确认通过，登录进入明确的手机号验证分支，尚未获得 OAuth token。按用户本轮要求，验收仅聚焦注册，未购买 SMS。另一次 ChatGPT 网页登录核验提交邮箱后反复回到 `/auth/login`，未获得认证接口响应，也未进入密码页；会话仍待确认。任务、诊断和测试脚本仅保存在忽略的 `data/validation-registration/`；未向工具配置的账号后台推送或部署服务。
+- 注册结果新增三种可选导出：完整成功账号的 `sub2api.json`、标准九字段 `cpa.json`（多条为 ZIP），以及建号已明确确认账号的 `邮箱----密码----2FA` 文本。CPA 丢失密码和 TOTP 字段时有警告；会话待确认的文本导出有单独警告，无 2FA 时用两列。合成测试覆盖范围选择、身份核对、缺少密码、文本格式限制和非注册任务拒绝；此项没有再次登录或重试真实邮箱。
+- 对照 aBaiFreeGPT 和 GPT-Register-Tool 的浏览器流程后补充一次性验证页推进：在 `/email-verification` 尚未显示 OTP 输入框时，仅允许点击一次明确的 Continue/Verify 控件，点击意图先写 checkpoint；之后仍未推进则停为 `uncertain`，不会重放。原始真实页面未识别到该控件，因此这项修复尚无真实网络成功证据；原始任务保持待人工核对，不用同一邮箱再试。
+- 邮箱验证码的新旧邮件边界从提交邮箱前开始计时，避免邮件先于 OTP 输入框出现时被错误丢弃；仍以提交前收件箱快照排除旧邮件。
+
 验证日期：2026-10-02。
 
 ## 协议登录后续跳转修复（2026-10-02）

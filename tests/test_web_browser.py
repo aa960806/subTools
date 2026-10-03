@@ -119,6 +119,23 @@ def test_browser_handoff_commands_and_cancellation(browser):
     assert bridge.page is None and bridge.frame is None
 
 
+def test_registration_export_controls_are_scoped_to_registration_page(browser, site):
+    page = browser.new_page(viewport={'width':430, 'height':932})
+    page.goto(site)
+    page.locator('#login-password').fill('fixture-password-for-web')
+    page.locator('#login-form button').click()
+    page.locator('#app').wait_for(state='visible')
+    expect(page.locator('#export-registration-text')).to_be_hidden()
+    page.locator('[data-page=register]').click()
+    expect(page.locator('#export-registration-text')).to_be_visible()
+    expect(page.locator('#export-sub2')).to_have_text('导出 sub2api.json')
+    expect(page.locator('#export-cpa')).to_have_text('导出 cpa.json')
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1')
+    page.locator('[data-page=auth]').click()
+    expect(page.locator('#export-registration-text')).to_be_hidden()
+    page.close()
+
+
 def test_protocol_prompt_and_explicit_browser_retry(browser, site, monkeypatch):
     from openai_reauth import ReauthResult
     attempts = []

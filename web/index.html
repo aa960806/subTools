@@ -33,6 +33,7 @@
         <small class="nav-label">账号处理</small>
         <nav>
           <button data-page="auth">◈ <span>批量授权</span></button
+          ><button data-page="register">＋ <span>自动注册</span></button
           ><button data-page="phone">▣ <span>手机接码</span></button>
         </nav>
         <small class="nav-label">数据管理</small>
@@ -72,7 +73,7 @@
                     ><button id="clear" class="ghost">清空</button>
                   </div>
                 </div>
-                <p class="hint">
+                <p id="input-hint" class="hint">
                   支持账号行、sub2 / CPA / Session / 9router
                   JSON；多个账号分行输入。
                 </p>
@@ -171,10 +172,11 @@
                       待补手机转接码
                     </button>
                     <div class="spacer"></div>
-                    <span class="hint">已勾选时仅导出选中成功项</span>
+                    <span id="export-hint" class="hint">已勾选时仅导出选中成功项</span>
                     <button id="export-sub2-single" class="ghost">拆分 sub2</button>
                     <button id="export-sub2" class="secondary">导出 sub2</button
-                    ><button id="export-cpa" class="secondary">导出 CPA</button>
+                    ><button id="export-cpa" class="secondary">导出 CPA</button
+                    ><button id="export-registration-text" class="secondary" hidden>导出账号密码</button>
                   </div>
                 </div>
                 <pre id="logs-panel" hidden aria-live="polite"></pre>

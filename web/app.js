@@ -32,6 +32,7 @@ let historyOffset = 0;
 let loginPromptKey = null;
 const labels = {
   auth: "批量授权",
+  register: "自动注册",
   phone: "手机接码",
   convert: "格式转换",
   pool: "推送到池",
@@ -64,6 +65,11 @@ const states = {
   rate_limited: "已限流",
   circuit_open: "已熔断",
   phone_fraud: "风控拒绝",
+  registration_disabled: "注册适配器未启用",
+  registration_cancelled: "已停止",
+  auth_session_pending: "会话待恢复",
+  partial_registered: "半注册",
+  existing_account: "邮箱已存在",
 };
 const good = (s) => ["success", "created", "updated"].includes(s),
   pending = (s) =>
@@ -74,6 +80,10 @@ const good = (s) => ["success", "created", "updated"].includes(s),
       "pushing",
       "refreshing",
       "relogin",
+      "uncertain",
+      "auth_session_pending",
+      "partial_registered",
+      "existing_account",
     ].includes(s);
 async function api(path, method = "GET", data, blob = false) {
   const options = {
@@ -181,16 +191,21 @@ function updateLoginSettings() {
 function running(v) {
   return `<h3>运行设置</h3>${page === "auth" ? loginSettings(v) : ""}${input("timeout", "每账号处理超时（秒）", v, "number")}${check("show_browser", "显示浏览器（网页内查看与操作）", v)}${check("human_pacing", "启用步骤等待", v)}${input("human_scale", "等待时间倍数", v, "number")}`;
 }
+function registrationSettings(v) {
+  return `${network(v)}<h3>注册运行</h3>${input("timeout", "每账号处理超时（秒）", v, "number")}${input("otp_timeout", "邮箱验证码超时（秒）", v, "number")}${input("signup_url", "注册入口 URL", v)}${select("driver", "注册适配器", v, [["disabled", "未启用（仅检查输入）"], ["fixture", "本地合成 fixture"], ["playwright", "受控 Playwright 浏览器"]])}${check("show_browser", "显示注册浏览器", v)}${check("require_totp", "要求注册流程支持二次验证", v)}${check("human_pacing", "启用步骤等待", v)}${input("human_scale", "等待时间倍数", v, "number")}<p class="hint">Playwright 适配器会在 CAPTCHA、安全挑战、已有账号或结果不明确时停止并保留 checkpoint；不会自动重放提交。默认驱动仍为 disabled。</p>`;
+}
 function renderSettings() {
-  if (!["auth", "phone", "pool"].includes(page)) return;
+  if (!["auth", "register", "phone", "pool"].includes(page)) return;
   const v = configs[page];
   let html = "";
   $("#settings-title").textContent = {
     auth: "授权设置",
+    register: "自动注册设置",
     phone: "接码设置",
     pool: "推池设置",
   }[page];
   if (page === "auth") html = network(v) + running(v);
+  if (page === "register") html = registrationSettings(v);
   if (page === "phone") {
     html =
       network(v) +
@@ -453,7 +468,7 @@ function collect() {
   return data;
 }
 async function save() {
-  if (!["auth", "phone", "pool"].includes(page)) return;
+  if (!["auth", "register", "phone", "pool"].includes(page)) return;
   const kind = page;
   const data = collect();
   configs[kind] = await api("/config/" + kind, "PUT", data);
@@ -471,7 +486,7 @@ async function save() {
 }
 async function navigate(next) {
   if (current?.fingerprint) current.importSelection = [...selected];
-  if (settingsReady && ["auth", "phone", "pool"].includes(page)) {
+  if (settingsReady && ["auth", "register", "phone", "pool"].includes(page)) {
     drafts[page] = $("#account-input").value;
     Object.assign(configs[page], collect());
   }
@@ -484,17 +499,21 @@ async function navigate(next) {
     b.classList.toggle("active", b.dataset.page === page),
   );
   $("#page-title").textContent = labels[page];
-  $("#breadcrumb").textContent = ["auth", "phone"].includes(page)
+  $("#breadcrumb").textContent = ["auth", "register", "phone"].includes(page)
     ? "账号处理"
     : "数据管理";
   $("#page-description").textContent = {
     auth: "重新获取账号凭据，成功结果自动保存。",
+    register: "校验邮箱接码地址并运行受控注册流程；默认不会连接外部平台。",
     phone: "复用 OAuth 登录流程，自动补绑手机号。",
     convert: "多种账号格式互转，导出前清晰查看差异。",
     pool: "连接 sub2api，按身份更新凭据和分组配置。",
     history: "查阅、恢复与继续你的处理任务。",
   }[page];
-  $("#work-page").hidden = !["auth", "phone", "pool"].includes(page);
+  $("#input-hint").textContent = page === "register"
+    ? "每行填写邮箱、密码和邮箱接码地址；接码地址必须与邮箱严格匹配。也支持 registration JSON。"
+    : "支持账号行、sub2 / CPA / Session / 9router JSON；多个账号分行输入。";
+  $("#work-page").hidden = !["auth", "register", "phone", "pool"].includes(page);
   $("#convert-page").hidden = page !== "convert";
   $("#history-page").hidden = page !== "history";
   if (page === "history") {
@@ -506,12 +525,20 @@ async function navigate(next) {
   renderSettings();
   $("#start").textContent = {
     auth: "开始授权 →",
+    register: "开始注册 →",
     phone: "开始接码 →",
     pool: "开始推送 →",
   }[page];
   $("#defer").hidden = page !== "pool";
   $$("[data-tab=inspection]").forEach((b) => (b.hidden = page !== "pool"));
-  $("#transfer-pool").hidden = page === "pool";
+  $("#transfer-pool").hidden = page === "pool" || page === "register";
+  $("#transfer-phone").hidden = page === "pool" || page === "register";
+  $("#export-registration-text").hidden = page !== "register";
+  $("#export-hint").textContent = page === "register"
+    ? "已勾选时仅导出选中账号；CPA 不保留密码和 2FA"
+    : "已勾选时仅导出选中成功项";
+  $("#export-sub2").textContent = page === "register" ? "导出 sub2api.json" : "导出 sub2";
+  $("#export-cpa").textContent = page === "register" ? "导出 cpa.json" : "导出 CPA";
   tab("results");
   renderTask();
 }
@@ -525,7 +552,7 @@ function tab(name) {
 function renderTask() {
   const t = current;
   renderLoginPrompt();
-  $("#browser-open").hidden = t?.login_method === "protocol";
+  $("#browser-open").hidden = page === "register" || t?.login_method === "protocol";
   const rows = t?.rows || [];
   $("#count").textContent = `${rows.length} 个账号`;
   $("#stat-success").textContent = rows.filter((r) => good(r.state)).length;
@@ -638,7 +665,7 @@ async function poll() {
         renderTask();
       }
     }
-    if (["auth", "phone", "pool"].includes(page)) {
+    if (["auth", "register", "phone", "pool"].includes(page)) {
       $("#start").disabled = Boolean(active);
       $("#stop").disabled = !active;
     }
@@ -919,7 +946,7 @@ on("#start", async () => {
   active = task.id;
   selected.clear();
   renderTask();
-  if (configs[page].login_method !== "protocol" && configs[page].show_browser) notify("可点击“查看登录浏览器”进行手动操作");
+  if (page !== "register" && configs[page].login_method !== "protocol" && configs[page].show_browser) notify("可点击“查看登录浏览器”进行手动操作");
 });
 $("#login-input-card").onsubmit = act(async (event) => {
   event.preventDefault();
@@ -1014,7 +1041,7 @@ for (const target of ["pool", "phone"])
     drafts[target] = result.text;
     await navigate(target);
   });
-for (const target of ["sub2", "sub2-single", "cpa"])
+for (const target of ["sub2", "sub2-single", "cpa", "registration-text"])
   on("#export-" + target, async () => {
     if (!current?.id) throw Error("没有任务可导出");
     const scope = selected.size ? "&selected=" + encodeURIComponent([...selected].join(",")) : "";
@@ -1023,14 +1050,14 @@ for (const target of ["sub2", "sub2-single", "cpa"])
     );
     if (
       check.warnings.length &&
-      !confirm(check.warnings.join("\n") + "\n仍按标准格式导出？")
+      !confirm(check.warnings.join("\n") + "\n仍继续导出？")
     )
       return;
     await download(
       "/tasks/" + current.id + "/export?target=" + target + scope,
       "GET",
       undefined,
-      target === "cpa" ? "cpa-accounts.zip" : "accounts.json",
+      target === "registration-text" ? "registered-accounts.txt" : target === "cpa" ? "cpa-accounts.zip" : "accounts.json",
     );
   });
 on("#inspect", async () => {

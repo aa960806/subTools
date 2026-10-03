@@ -26,6 +26,7 @@ from pool_client import PoolSettings, PoolClient, PoolError
 from pool_flow import parse_push_text, run_pool_push
 from pool_inspection import inspect_pool, inspection_delta
 from pool_recovery import PoolJournal
+from registration_flow import PlaywrightRegistrationAdapter, RegistrationInput, SafeRegistrationAdapter, run_batch_registration
 from reauth_conversion import parse_conversion_text
 from reauth_formats import build_export_payload, build_cpa_payload, safe_email_filename, conversion_warnings, _conversion_identity
 from server_storage import Store
@@ -44,8 +45,12 @@ DEFAULTS = {
     'pool': {'site': '', 'auth_kind': 'api_key', 'credential': '', 'group_ids': [], 'priority': 50,
              'concurrency': 3, 'model_mode': 'preserve', 'model_choices': {}, 'scheduling_mode': 'override',
              'proxy_id': None, 'load_factor': None, 'timeout': 180, 'show_browser': False, 'login_method': 'browser'},
+    'register': {'network_mode': 'direct', 'proxy': '', 'proxy_scheme': 'http', 'timeout': 900,
+                 'otp_timeout': 300, 'driver': 'disabled', 'signup_url': 'https://chatgpt.com/auth/login',
+                 'show_browser': False, 'require_totp': True,
+                 'human_pacing': True, 'human_scale': 1.0},
 }
-SECRET_FIELDS = {'auth': ('proxy',), 'phone': ('api_key', 'proxy'), 'pool': ('credential',)}
+SECRET_FIELDS = {'auth': ('proxy',), 'phone': ('api_key', 'proxy'), 'pool': ('credential',), 'register': ('proxy',)}
 
 
 def integer(value, label, minimum=0, maximum=10000):
@@ -123,6 +128,21 @@ def export_bytes(accounts, target):
         for name, content in members:
             archive.writestr(name, content)
     return stream.getvalue(), f'{target}-accounts.zip', 'application/zip', warnings
+
+
+def registration_credentials_bytes(records):
+    if not records:
+        raise ValueError('没有可导出的已建号账号')
+    lines = []
+    for record in records:
+        fields = [record['email'], record['password']]
+        if record['totp_secret']:
+            fields.append(record['totp_secret'])
+        if any(not isinstance(value, str) or not value or '----' in value or '\r' in value or '\n' in value
+               for value in fields):
+            raise ValueError('账号凭据含有文本格式无法表示的字符，请使用 JSON 导出')
+        lines.append('----'.join(fields))
+    return ('\n'.join(lines) + '\n').encode('utf-8'), 'registered-accounts.txt', 'text/plain; charset=utf-8'
 
 
 class Engine:
@@ -219,15 +239,56 @@ class Engine:
             raise ValueError('选中范围内没有成功结果可导出')
         return accounts
 
+    def export_registration_credentials(self, task_id, selected=None):
+        task = self.get(task_id)
+        if task['kind'] != 'register':
+            raise ValueError('账号密码格式仅用于注册任务')
+        if selected is not None:
+            if not isinstance(selected, list) or not selected or any(not isinstance(uid, str) for uid in selected):
+                raise ValueError('请选择要导出的账号')
+            if not set(selected) <= {row['uid'] for row in task['rows']}:
+                raise ValueError('选中账号不属于此任务')
+        records, warnings = [], []
+        for index, row in enumerate(task['rows'], 1):
+            uid = row['uid']
+            if selected is not None and uid not in selected:
+                continue
+            item = task['items'][int(uid)]
+            checkpoint = item.get('checkpoint') or {}
+            account = task['accounts'].get(uid) if row['state'] == 'success' else None
+            confirmed = checkpoint.get('create_confirmed') is True
+            if not confirmed and not (account and account.get('platform') == 'openai'):
+                continue
+            credentials = (account or {}).get('credentials') or {}
+            email = str(row['email'])
+            if str(credentials.get('email') or email).casefold() != email.casefold():
+                raise ValueError('账号身份与注册记录不一致，已拒绝导出')
+            password = str(credentials.get('password') or item.get('password') or '')
+            if not password:
+                raise ValueError('已建号账号缺少保存的注册密码，已拒绝导出')
+            totp_secret = str(credentials.get('totp_secret') or item.get('totp_secret') or '')
+            records.append({'email': email, 'password': password, 'totp_secret': totp_secret})
+            if confirmed and account is None:
+                warnings.append(f'第 {index} 条已建号但会话未确认；导出凭据不代表账号登录可用。')
+            if not totp_secret:
+                warnings.append(f'第 {index} 条未绑定 2FA，文本记录使用邮箱和密码两列。')
+        if not records:
+            raise ValueError('没有可导出的已建号账号')
+        return records, warnings
+
     def preview(self, kind, text):
         if kind == 'pool':
             jobs = parse_push_text(text)
             return [{'email':j.email, 'message':j.message} for j in jobs]
+        if kind == 'register':
+            from registration_flow import load_registration_inputs
+            return [{'email': item.email, 'message': '邮箱与接码地址已校验'}
+                    for item in load_registration_inputs(text, self.max_accounts)]
         items = parse_phone_jobs(text) if kind == 'phone' else load_accounts(text)
         return [{'email':x.email, 'message':'已有凭据，优先刷新' if x.oauth_account else '等待 OAuth 登录'} for x in items]
 
     def start(self, kind, text='', *, previous=None, selected=None, relogin=False, import_selected=None, fingerprint=None):
-        if kind not in ('auth', 'phone', 'pool', 'inspect'):
+        if kind not in ('auth', 'phone', 'pool', 'register', 'inspect'):
             raise ValueError('任务类型无效')
         if not self.gate.acquire(blocking=False):
             raise ValueError('已有任务运行，请先停止或等待结束')
@@ -242,6 +303,10 @@ class Engine:
                 integer(config['timeout'], '账号超时', 30, 7200)
                 human_settings_from_options(pacing_options(configs['auth' if kind == 'pool' else kind]))
                 proxy_for(configs['auth' if kind == 'pool' else kind])
+                if kind == 'register':
+                    integer(config['otp_timeout'], '邮箱验证码超时', 30, 3600)
+                    if config.get('driver', 'disabled') not in ('disabled', 'fixture', 'playwright'):
+                        raise ValueError('注册驱动无效；支持 disabled、fixture 或 playwright')
             if kind == 'phone':
                 sms_settings(config)
             with self.lock:
@@ -261,7 +326,9 @@ class Engine:
                 if selected is not None and not set(selected) <= {r['uid'] for r in task['rows']}:
                     raise ValueError('选中账号不属于此任务')
                 chosen = [r['uid'] for r in task['rows'] if (selected is None or r['uid'] in selected)
-                          and r['state'] not in ('success','created','updated','deferred')]
+                           and r['state'] not in ('success','created','updated','deferred',
+                                                 'partial_registered','existing_account',
+                                                 'auth_session_pending')]
                 if kind != 'inspect' and not chosen:
                     raise ValueError('没有可处理账号；成功或暂缓账号不会重复执行')
                 if previous and kind != 'inspect' and config.get('login_method', 'browser') == 'browser' and (relogin or any(r['uid'] in chosen and r['state']=='needs_interaction' for r in task['rows'])):
@@ -393,6 +460,48 @@ class Engine:
                     timeout=int(config['timeout']), proxy=proxy_for(configs['auth']), headless=not config['show_browser'],
                     recovery_dir=recovery, journal=journal, journal_jobs=jobs, authorize=authorize,
                     relogin_ids=tuple(chosen) if relogin else ())
+            elif kind == 'register':
+                items = [RegistrationInput(**task['items'][int(uid)]) for uid in chosen]
+                def registration_stage(email, key):
+                    # Registration has its own stage vocabulary; map it to the
+                    # shared progress trail without importing desktop modules.
+                    stage(email, key)
+                    log(f'{email}：注册阶段 {key}')
+                def registration_progress(index, total, result):
+                    uid = chosen[index - 1]
+                    with self.lock:
+                        row = next(r for r in task['rows'] if r['uid'] == uid)
+                        row.update(state='success' if result.ok else result.category,
+                                   message=result.error or '注册完成',
+                                   registration_state=result.registration_state)
+                        finish_stage(row)
+                        item = items[index - 1]
+                        item.checkpoint = dict(result.checkpoint or {})
+                        task['items'][int(uid)] = asdict(item)
+                        if result.ok and result.account:
+                            task['accounts'][uid] = result.account
+                        self._save(task)
+                def registration_checkpoint(index, item, payload):
+                    uid = chosen[index - 1]
+                    with self.lock:
+                        task['items'][int(uid)] = asdict(item)
+                        self._save(task)
+                registration_adapter = (PlaywrightRegistrationAdapter()
+                    if config.get('driver') == 'playwright' else SafeRegistrationAdapter())
+                registration_config = {**config, 'proxy': proxy_for(config) or ''}
+                run_batch_registration(
+                    items,
+                    registration_config,
+                    should_stop=self.stop.is_set,
+                    on_stage=registration_stage,
+                    on_progress=registration_progress,
+                    on_checkpoint=registration_checkpoint,
+                    checkpoint_dir=self.root / 'tasks' / task['id'] / 'registration-checkpoints',
+                    adapter=registration_adapter,
+                )
+                with self.lock:
+                    for uid, item in zip(chosen, items):
+                        task['items'][int(uid)] = asdict(item)
             else:
                 items = [AccountInput(**task['items'][int(uid)]) for uid in chosen]
                 if kind == 'auth':

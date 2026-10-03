@@ -16,7 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from server_storage import configure_storage, Store
-from server_engine import Engine, integer, export_bytes
+from server_engine import Engine, integer, export_bytes, registration_credentials_bytes
 from reauth_conversion import parse_conversion_text
 from reauth_formats import build_export_payload, build_cpa_payload, conversion_warnings, account_conversion_status
 from phone_smsbower import COUNTRY_CATALOG, COUNTRY_PINYIN, country_label
@@ -159,11 +159,11 @@ def create_app(data_dir=None, password=None):
         response=JSONResponse({'ok':True});response.delete_cookie('subtools_session');return response
 
     @app.get('/api/config')
-    def configs(): return {k:app.state.engine.config(k,public=True) for k in ('auth','phone','pool')}
+    def configs(): return {k:app.state.engine.config(k,public=True) for k in ('auth','phone','pool','register')}
 
     @app.put('/api/config/{kind}')
     async def configure(kind:str,request:Request):
-        if kind not in ('auth','phone','pool'): raise ValueError('配置类型无效')
+        if kind not in ('auth','phone','pool','register'): raise ValueError('配置类型无效')
         return app.state.engine.save_config(kind,await payload(request))
 
     @app.get('/api/status')
@@ -179,7 +179,7 @@ def create_app(data_dir=None, password=None):
 
     @app.post('/api/preview/{kind}')
     async def preview(kind:str,request:Request):
-        if kind not in ('auth','phone','pool'): raise ValueError('类型无效')
+        if kind not in ('auth','phone','pool','register'): raise ValueError('类型无效')
         data=await payload(request)
         return app.state.engine.preview(kind,data.get('text',''))
 
@@ -254,16 +254,25 @@ def create_app(data_dir=None, password=None):
             if t['kind']=='inspect':
                 if not t.get('report'): raise ValueError('巡检尚未完成')
                 content=json.dumps(t['report'],ensure_ascii=False,indent=2).encode();name='inspection.json';media='application/json'
+            elif target == 'registration-text':
+                records,_=e.export_registration_credentials(task_id, selected.split(',') if selected is not None else None)
+                content,name,media=registration_credentials_bytes(records)
             else:
                 accounts=e.export_accounts(task_id, selected.split(',') if selected is not None else None)
                 content,name,media,_=export_bytes(accounts,target)
+                if t['kind']=='register' and target=='sub2': name='sub2api.json'
+                if t['kind']=='register' and target=='cpa' and media=='application/json': name='cpa.json'
         return Response(content,media_type=media,headers={'Content-Disposition':f"attachment; filename*=UTF-8''{quote(name, safe='')}"})
 
     @app.get('/api/tasks/{task_id}/export-warnings')
     def export_warnings(task_id:str,target:str='sub2', selected: str | None = None):
-        if target not in ('sub2','sub2-single','cpa'): raise ValueError('目标格式无效')
+        if target not in ('sub2','sub2-single','cpa','registration-text'): raise ValueError('目标格式无效')
         e=app.state.engine
         with e.lock:
+            if target=='registration-text':
+                records,warnings=e.export_registration_credentials(task_id, selected.split(',') if selected is not None else None)
+                registration_credentials_bytes(records)
+                return {'warnings':warnings}
             accounts=e.export_accounts(task_id, selected.split(',') if selected is not None else None)
             return {'warnings':conversion_warnings(accounts,'sub2' if target == 'sub2-single' else target)}
 
