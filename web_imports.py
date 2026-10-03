@@ -4,11 +4,23 @@ import json
 
 from account_inputs import input_records, account_input_from_mapping, parse_account_line
 from pool_flow import parse_push_text, identity_of
+from registration_flow import load_registration_inputs, registration_fingerprint
 
 
 def preview_import(kind, text, max_accounts):
-    if kind not in ('auth', 'phone', 'pool') or not isinstance(text, str):
+    if kind not in ('auth', 'phone', 'pool', 'register') or not isinstance(text, str):
         raise ValueError('输入类型无效')
+    if kind == 'register':
+        try:
+            items = load_registration_inputs(text, max_accounts)
+        except ValueError as exc:
+            return {'rows': [], 'errors': [str(exc)], 'fingerprint': registration_fingerprint(text)}, {}
+        rows = [{'uid': str(index), 'line': item.source_line, 'email': item.email,
+                 'state': 'ready', 'message': '邮箱与接码地址已校验', 'selectable': True,
+                 'default_selected': True} for index, item in enumerate(items)]
+        return {'rows': rows, 'errors': [], 'fingerprint': registration_fingerprint(text)}, {
+            str(index): (item, ('registration', item.email.casefold())) for index, item in enumerate(items)
+        }
     rows, items, errors, identities = [], {}, [], {}
     try:
         for index, (line, raw) in enumerate(input_records(text)):
@@ -72,6 +84,10 @@ def select_import(kind, text, max_accounts, selected=None, fingerprint=None):
             raise ValueError('请选择有效账号记录')
     if not selected:
         raise ValueError('请至少选择一个有效账号')
+    if kind == 'register':
+        # Registration inputs do not carry the OAuth account field used by
+        # auth/phone/pool records. Preserve the validated input order here.
+        return [item for uid, (item, _) in items.items() if uid in selected]
     keys = [items[uid][1] for uid in selected]
     if len(keys) != len(set(keys)):
         raise ValueError('同一身份只能选择一条，请核对重复记录')
