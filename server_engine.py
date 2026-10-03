@@ -28,6 +28,8 @@ from pool_inspection import inspect_pool, inspection_delta
 from pool_recovery import PoolJournal
 from registration_flow import (PlaywrightRegistrationAdapter, RegistrationInput, SafeRegistrationAdapter,
                                run_batch_registration, validate_registration_url)
+from registration_history import RegistrationHistory
+from registration_policy import registration_progress
 from reauth_conversion import parse_conversion_text
 from reauth_formats import build_export_payload, build_cpa_payload, safe_email_filename, conversion_warnings, _conversion_identity
 from server_storage import Store
@@ -48,6 +50,7 @@ DEFAULTS = {
              'proxy_id': None, 'load_factor': None, 'timeout': 180, 'show_browser': False, 'login_method': 'browser'},
     'register': {'network_mode': 'direct', 'proxy': '', 'proxy_scheme': 'http', 'timeout': 900,
                  'otp_timeout': 300, 'driver': 'disabled', 'signup_url': 'https://chatgpt.com/auth/login',
+                  'page_timeout': 60, 'session_timeout': 60, 'oauth_timeout': 120,
                  'show_browser': False, 'require_totp': True,
                  'human_pacing': True, 'human_scale': 1.0},
 }
@@ -150,6 +153,7 @@ class Engine:
     def __init__(self, root):
         self.root = Path(root)
         self.store = Store(root)
+        self.registration_history = RegistrationHistory(self.store)
         self.lock = threading.RLock()
         self.gate = threading.Lock()
         self.max_accounts = integer(os.environ.get('SUBTOOLS_MAX_ACCOUNTS', '200'), '单批账号上限', 1, 10000)
@@ -199,6 +203,8 @@ class Engine:
                 validate_registration_url(value['signup_url'])
                 if value['driver'] not in ('disabled', 'fixture', 'playwright'):
                     raise ValueError('注册驱动无效')
+                for key in ('page_timeout', 'session_timeout', 'oauth_timeout'):
+                    integer(value[key], key, 5, 7200)
             self.store.write(f'config/{kind}.json', value)
             if kind == 'pool' and any(value[k] != previous[k] for k in ('site', 'auth_kind', 'credential', 'group_ids')):
                 self.schedule = None
@@ -206,6 +212,8 @@ class Engine:
 
     def _save(self, task):
         self.tasks.save(task)
+        if task['kind'] == 'register':
+            self.registration_history.record_task(task)
 
     def get(self, task_id):
         with self.lock:
@@ -222,6 +230,9 @@ class Engine:
             for row in result.get('rows', []):
                 end = time.time() if row.get('stage_active') else row.get('stage_finished', row.get('stage_started', 0))
                 row['stage_seconds'] = max(0, int(end - row.get('stage_started', end)))
+                if task['kind'] == 'register':
+                    row['registration'] = registration_progress(task['items'][int(row['uid'])], row,
+                                                                 task.get('accounts', {}).get(row['uid']))
             return result
 
     def list_tasks(self):
@@ -257,6 +268,10 @@ class Engine:
         for index, row in enumerate(task['rows'], 1):
             uid = row['uid']
             if selected is not None and uid not in selected:
+                continue
+            if row.get('source_task'):
+                # A duplicate import is only a pointer to the original task;
+                # its newly pasted password is not a confirmed credential.
                 continue
             item = task['items'][int(uid)]
             checkpoint = item.get('checkpoint') or {}
@@ -313,11 +328,17 @@ class Engine:
                 if kind == 'register':
                     validate_registration_url(config['signup_url'])
                     integer(config['otp_timeout'], '邮箱验证码超时', 30, 3600)
+                    for key in ('page_timeout', 'session_timeout', 'oauth_timeout'):
+                        integer(config[key], key, 5, 7200)
                     if config.get('driver', 'disabled') not in ('disabled', 'fixture', 'playwright'):
                         raise ValueError('注册驱动无效；支持 disabled、fixture 或 playwright')
             if kind == 'phone':
                 sms_settings(config)
             with self.lock:
+                if kind == 'register':
+                    if self.tasks.warnings:
+                        raise ValueError('存在无法读取的历史任务；请先核对数据密钥或备份，未开始注册')
+                    self.registration_history.reconcile(self.tasks)
                 if previous:
                     task = self.get(previous)
                     if task['kind'] != kind:
@@ -329,16 +350,24 @@ class Engine:
                             'items':[asdict(x) for x in items], 'rows':[], 'accounts':{}, 'logs':[], 'message':'等待处理', 'report':None}
                     task['rows'] = [{'uid':x.uid if kind == 'pool' else str(i), 'email':x.email, 'state':'ready', 'message':'等待处理', 'account_id':None}
                                     for i,x in enumerate(items)]
+                    if kind == 'register':
+                        for item, row in zip(task['items'], task['rows']):
+                            prior = self.registration_history.lookup(item['email'])
+                            if prior:
+                                item['checkpoint'] = copy.deepcopy(prior['checkpoint'])
+                                row.update(state='registration_blocked', source_task=prior['task_id'],
+                                           message='此邮箱已有注册提交记录；请查看原任务并按已确认阶段恢复，未重复注册')
                 if selected is not None and (not isinstance(selected, list) or any(not isinstance(v,str) for v in selected)):
                     raise ValueError('选中账号列表无效')
                 if selected is not None and not set(selected) <= {r['uid'] for r in task['rows']}:
                     raise ValueError('选中账号不属于此任务')
                 excluded = {'success', 'created', 'updated', 'deferred'}
                 if kind == 'register':
-                    excluded.update({'partial_registered', 'existing_account', 'auth_session_pending'})
+                    excluded.update({'partial_registered', 'existing_account', 'auth_session_pending', 'registration_blocked'})
                 chosen = [r['uid'] for r in task['rows'] if (selected is None or r['uid'] in selected)
                            and r['state'] not in excluded]
-                if kind != 'inspect' and not chosen:
+                blocked_import = kind == 'register' and not previous and any(r['state'] == 'registration_blocked' for r in task['rows'])
+                if kind != 'inspect' and not chosen and not blocked_import:
                     raise ValueError('没有可处理账号；成功或暂缓账号不会重复执行')
                 if previous and kind != 'inspect' and config.get('login_method', 'browser') == 'browser' and (relogin or any(r['uid'] in chosen and r['state']=='needs_interaction' for r in task['rows'])):
                     config['show_browser'] = True
@@ -605,6 +634,36 @@ class Engine:
     def transfer(self, task_id, target, selected=None):
         with self.lock:
             task = self.get(task_id)
+            if task['kind'] == 'register':
+                if self.active == task_id:
+                    raise ValueError('请等待注册任务结束后再转入')
+                if selected is not None and (not isinstance(selected, list) or not selected
+                        or any(not isinstance(uid, str) for uid in selected)
+                        or not set(selected) <= {r['uid'] for r in task['rows']}):
+                    raise ValueError('请选择此注册任务中的有效账号')
+                if target not in {'auth', 'phone', 'pool'}:
+                    raise ValueError('注册恢复目标无效')
+                records = []
+                for row in task['rows']:
+                    if selected is not None and row['uid'] not in selected:
+                        continue
+                    raw = task['items'][int(row['uid'])]
+                    account = task.get('accounts', {}).get(row['uid'])
+                    if target not in registration_progress(raw, row, account)['actions']:
+                        if selected is not None:
+                            raise ValueError('选中账号尚未确认可执行此步骤；请核对状态或查看原任务')
+                        continue
+                    if target == 'pool':
+                        records.append(account)
+                    else:
+                        # Graph credentials are mailbox credentials, never OpenAI
+                        # login credentials. Pending TOTP secrets are preserved;
+                        # these existing flows do not enroll a second factor.
+                        records.append(login_mapping(AccountInput(raw['email'], raw.get('password', ''),
+                            raw.get('totp_secret', ''), raw.get('source_line', 0), raw.get('mailbox_url', ''))))
+                if not records:
+                    raise ValueError('没有可转入的账号；未确认建号的记录须先人工核对')
+                return json.dumps(records, ensure_ascii=False, indent=2)
             if target == 'phone':
                 rows = [r for r in task['rows'] if (selected is None or r['uid'] in selected) and r['state'] in ('phone_required','deferred','failed','needs_interaction')]
                 records = []

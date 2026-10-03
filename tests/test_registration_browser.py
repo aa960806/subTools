@@ -12,8 +12,9 @@ from test_protocol_login import tokens
 pytestmark = pytest.mark.skipif(os.environ.get('SUBTOOLS_BROWSER_TEST') != '1', reason='opt-in local browser smoke')
 
 
-@pytest.mark.parametrize('activation', ['confirmed', 'lost'])
-def test_browser_registration_checkpoint_oauth_and_exports(engine, monkeypatch, activation):
+@pytest.mark.parametrize('activation,session_shape', [
+    ('confirmed', 'top'), ('lost', 'top'), ('confirmed', 'nested_without_cookie'), ('confirmed', 'rate_limited')])
+def test_browser_registration_checkpoint_oauth_and_exports(engine, monkeypatch, activation, session_shape):
     requests, oauth_calls, observations = [], [], []
     email = 'fixture@example.com'
     secret = 'JBSWY3DPEHPK3PXP'
@@ -36,12 +37,15 @@ def test_browser_registration_checkpoint_oauth_and_exports(engine, monkeypatch, 
         path = urlsplit(request.url).path
         requests.append(path)
         if path in pages:
-            headers = {'set-cookie':'__Secure-next-auth.session-token.0=fixture; Path=/; Secure'} if path=='/' else {}
+            headers = {'set-cookie':'__Secure-next-auth.session-token.0=fixture; Path=/; Secure'} if path=='/' and session_shape!='nested_without_cookie' else {}
             return r.fulfill(status=200, content_type='text/html', body=pages[path], headers=headers)
         if path == '/api/accounts/create_account':
             return r.fulfill(status=200, json={'redirect':'https://chatgpt.com/'})
         if path == '/api/auth/session':
-            return r.fulfill(status=200, json={'user':{'email':email}, 'accessToken':'fixture-session-token'})
+            if session_shape == 'rate_limited':
+                return r.fulfill(status=429, json={'error':'rate limit'})
+            session = {'user':{'email':email}, 'accessToken':'fixture-session-token'}
+            return r.fulfill(status=200, json={'session':session} if session_shape=='nested_without_cookie' else session)
         if path.endswith('/mfa/enroll'):
             return r.fulfill(status=200, json={'secret':secret,'session_id':'fixture-sid'})
         if path.endswith('/activate_enrollment'):
@@ -87,10 +91,20 @@ def test_browser_registration_checkpoint_oauth_and_exports(engine, monkeypatch, 
     monkeypatch.setattr('openai_reauth.CallbackServer', Callback)
     monkeypatch.setattr('registration_flow.MailboxClient', Mailbox)
     engine.save_config('register', {'driver':'playwright','require_totp':True,'timeout':90})
-    task = engine.start('register', registration_text(email))
+    source = registration_text(email)
+    if session_shape == 'rate_limited':
+        source += '\n'+registration_text('second@example.com')
+    task = engine.start('register', source)
     engine.worker.join(45)
     assert not engine.worker.is_alive()
     final = engine.get(task['id'])
+    if session_shape == 'rate_limited':
+        assert [r['state'] for r in final['rows']] == ['rate_limited', 'not_processed']
+        assert not oauth_calls and not observations
+        assert requests.count('/api/auth/session') == 1
+        assert requests.count('/api/accounts/create_account') == 1
+        assert final['items'][0]['checkpoint']['create_confirmed']
+        return
     assert observations == ['secret saved before activation'], (final['rows'][0]['message'], requests)
     assert requests.count('/api/accounts/create_account') == 1
     assert requests.count('/backend-api/accounts/mfa/user/activate_enrollment') == 1
@@ -112,3 +126,44 @@ def test_browser_registration_checkpoint_oauth_and_exports(engine, monkeypatch, 
         assert list(checkpoint_dir.glob('*.json'))
         with pytest.raises(ValueError):
             engine.start('register', previous=task['id'])
+
+
+def test_existing_login_page_never_receives_generated_registration_password(engine, monkeypatch):
+    requests = []
+    def route(r):
+        from urllib.parse import urlsplit
+        path = urlsplit(r.request.url).path
+        requests.append(path)
+        if path == '/auth/login':
+            return r.fulfill(status=200, content_type='text/html', body='''
+                <form><input type="email"><button type="submit">Continue</button></form>
+                <script>document.querySelector('form').onsubmit=e=>{e.preventDefault();location.href='https://auth.openai.com/log-in/password'}</script>''')
+        if path == '/log-in/password':
+            return r.fulfill(status=200, content_type='text/html', body='''
+                <input type="password" autocomplete="current-password" oninput="fetch('/unexpected-password-input')">
+                <button type="submit">Continue</button>''')
+        return r.abort('blockedbyclient')
+    def launch(playwright, **_):
+        channel = os.environ.get('SUBTOOLS_TEST_BROWSER_CHANNEL')
+        b = playwright.chromium.launch(headless=True, **({'channel':channel} if channel else {}))
+        def context():
+            c = b.new_context()
+            c.route('**/*', route)
+            return c
+        return SimpleNamespace(new_context=context, close=b.close)
+    class Mailbox:
+        def __init__(self, *a, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def snapshot(self, *a, **kw): return object()
+    monkeypatch.setattr('openai_reauth.launch_browser', launch)
+    monkeypatch.setattr('registration_flow.MailboxClient', Mailbox)
+    engine.save_config('register', {'driver':'playwright'})
+    task = engine.start('register', registration_text('existing@example.com'))
+    engine.worker.join(20)
+    assert not engine.worker.is_alive()
+    final = engine.get(task['id'])
+    assert final['rows'][0]['state'] == 'existing_account'
+    assert '/unexpected-password-input' not in requests
+    assert not final['items'][0]['checkpoint']['side_effects'].get('password_submit_attempted')
+    assert engine.public(task['id'])['rows'][0]['registration']['actions'] == ['auth']

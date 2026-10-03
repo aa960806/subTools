@@ -1,5 +1,15 @@
 # 网页迁移验证记录
 
+## 注册对照优化（2026-10-03）
+
+- 修复已有账号登录密码页、数字资料框的阶段误判；Graph 邮件验证码支持多语言并过滤 HTML 噪声；统一顶层/嵌套 Session 解析。Session HTTP 429 保留已建号状态并停止余下账号，401/403 和临时失败分别报告。
+- 新增加密邮箱注册记录，覆盖新任务、服务器重启和旧归档任务；写入失败停止提交。重复输入只引用原任务，不能把新粘贴密码作为原账号凭据导出。注册页显示分阶段结果，提供显式转授权、转接码和成功转推池入口；只准备输入，不自动执行目标任务。
+- 页面、OTP、Session、OAuth 分别配置时间预算；去掉固定轮询次数上限，保留总超时、取消和未知提交不重放约束。90 秒页面等待测试跨越旧 45 次轮询上限，仍只提交一次。
+- Windows 全量：`python -m pytest -q --disable-warnings --maxfail=2`，**948 passed、13 skipped、102 subtests passed**。包括普通授权、协议登录、刷新、接码、转换、推池、存储和网页接口；另有 1 条 warning，旧 Tk 测试销毁控件时仍输出 after 回调诊断，但无测试失败。
+- 实际 Chromium、本地拦截页面：`SUBTOOLS_BROWSER_TEST=1 python -m pytest tests/test_registration_browser.py tests/test_registration_web_browser.py tests/test_web_browser.py tests/test_web_pool_browser.py -q`，**13 passed**。覆盖注册/TOTP、没有预期 Cookie 的嵌套 Session、Session 限流、旧账号页面不填写密码、重复任务跳回原任务、转授权及手机宽度布局；邮件、OAuth 和后台写入使用合成夹具。
+- `node --check web/app.js` 和 `git diff --check` 通过。本轮未进行真实注册、付费接码、真实后台写入或服务器部署；当前本机 Docker daemon 不可用，未重跑 Linux 容器验收。前次 Linux 结果属于下方对应版本，不作为本次 Linux 验收结果。
+- 来源与实现边界见 [注册对照优化说明](docs/registration-improvements-2026-10-03.md)。没有新增临时克隆目录。
+
 ## 自动注册分支合并审查（2026-10-03）
 
 - 审查并合并 `codex/automatic-registration` 的 `65a267b`。合并修复涉及注册副作用防重放、TOTP 激活前密钥持久化、OAuth 传递 TOTP、可信来源/身份校验、建号响应处理、成功结果与检查点保存顺序、批次限流、剩余超时、Graph refresh token 轮换保存及日志脱敏。原授权/协议/短信/推池引擎文件未改。详细影响与限制见 [review](docs/registration-review-2026-10-03.md)。

@@ -28,6 +28,7 @@ import httpx
 from account_inputs import input_records
 from phone_mailbox import MailboxClient, MailboxError, validate_mailbox_url
 from flow_control import check_running
+from registration_policy import graph_message_codes, session_candidate
 
 
 EMAIL_RE = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
@@ -367,7 +368,7 @@ def _run_registered_oauth(
         oauth_account,
         oauth,
         callback,
-        min(120, timeout),
+        timeout,
         should_stop,
         headless,
     )
@@ -462,15 +463,7 @@ class MicrosoftGraphMailboxClient:
 
     @staticmethod
     def _code(message):
-        sender = (((message.get("from") or {}).get("emailAddress") or {}).get("address") or "").casefold()
-        subject = str(message.get("subject") or "")
-        body = str((((message.get("body") or {}).get("content")) or ""))
-        text = f"{subject} {body}"
-        if not (sender.endswith("@openai.com") or "openai" in subject.casefold() or "chatgpt" in subject.casefold()):
-            return set()
-        if not re.search(r"code|验证码|登录代码|verification", subject, re.I):
-            return set()
-        return set(re.findall(r"(?<!\d)\d{6}(?!\d)", text))
+        return graph_message_codes(message)
 
     def snapshot(self, deadline=None, should_stop=None):
         from phone_mailbox import MailboxBaseline
@@ -723,9 +716,13 @@ class PlaywrightRegistrationAdapter:
         if parsed.hostname == "auth.openai.com":
             if lower.rstrip("/") in {"/add-phone", "/phone-verification"}:
                 return "phone"
+            if lower.rstrip("/") in {"/log-in/password", "/login/password"}:
+                return "login_password"
+            if PlaywrightRegistrationAdapter._visible(page, ['input[autocomplete="current-password"]']):
+                return "login_password"
             if "about-you" in lower:
                 return "about_you"
-            if any(part in lower for part in ("email-verification", "/verify", "/signup")):
+            if any(part in lower for part in ("email-verification", "/verify")):
                 if PlaywrightRegistrationAdapter._visible(page, [
                     'input[type="password"]', 'input[name="password"]', 'input[autocomplete="new-password"]']):
                     return "password"
@@ -739,14 +736,20 @@ class PlaywrightRegistrationAdapter:
             'input[type="password"]', 'input[name="password"]', 'input[autocomplete="new-password"]']):
             return "password"
         if PlaywrightRegistrationAdapter._visible(page, [
-            'input[autocomplete="one-time-code"]', 'input[inputmode="numeric"]',
-            'input[type="tel"]', 'input[name*="code" i]', 'input[id*="code" i]',
+            'input[name="name"]', 'input[autocomplete="name"]', 'input[type="date"]',
+            'input[name*="birth" i]', 'input[name="age"]', 'input[id$="-age"]',
+            '[role="spinbutton"][data-type]']):
+            return "about_you"
+        if PlaywrightRegistrationAdapter._visible(page, [
+            'input[autocomplete="one-time-code"]', 'input[name*="code" i]', 'input[id*="code" i]',
             'input[aria-label*="code" i]']):
             return "otp"
-        if PlaywrightRegistrationAdapter._visible(page, [
-            'input[name="name"]', 'input[autocomplete="name"]', 'input[type="date"]',
-            'input[name*="birth" i]', '[role="spinbutton"]']):
-            return "about_you"
+        try:
+            slots = page.locator('input[maxlength="1"][inputmode="numeric"], input[maxlength="1"][type="tel"]')
+            if slots.count() == 6 and all(slots.nth(i).is_visible(timeout=100) for i in range(6)):
+                return "otp"
+        except Exception:
+            pass
         if PlaywrightRegistrationAdapter._visible(page, [
             'input[type="email"]', 'input[name="email"]', 'input[autocomplete="email"]',
             'input[name="username"]', 'input[autocomplete="username"]']):
@@ -757,8 +760,10 @@ class PlaywrightRegistrationAdapter:
     def _fetch_session(page, timeout=45, should_stop=None):
         """Read the ChatGPT session in-page so browser cookies and origin are reused."""
         deadline = time.monotonic() + timeout
+        last_status, last_error, attempts = 0, "", 0
         while time.monotonic() < deadline:
             check_running(should_stop, deadline)
+            attempts += 1
             try:
                 payload = page.evaluate("""async (budgetMs) => {
                     if (location.origin !== 'https://chatgpt.com') return {status:0};
@@ -772,18 +777,29 @@ class PlaywrightRegistrationAdapter:
                     } finally { clearTimeout(timer); }
                 }""", max(1, int(min(5, deadline-time.monotonic())*1000)))
                 check_running(should_stop, deadline)
-                if isinstance(payload, dict) and int(payload.get("status") or 0) == 200:
+                last_status = int(payload.get("status") or 0) if isinstance(payload, dict) else 0
+                if last_status == 429:
+                    raise RegistrationFlowError("rate_limited", "读取 ChatGPT 会话返回 HTTP 429；已停止本批次", "auth_session")
+                if last_status in {401, 403}:
+                    raise RegistrationFlowError("session_http_error", f"读取 ChatGPT 会话返回 HTTP {last_status}；请核对登录状态和网络", "auth_session")
+                if last_status == 200:
                     data = json.loads(str(payload.get("text") or "{}"))
-                    if isinstance(data, dict) and (data.get("accessToken") or data.get("access_token")):
+                    if session_candidate(data):
                         return data
+                    last_error = "会话中缺少有效 accessToken"
+                else:
+                    last_error = "会话服务暂时不可用" if last_status >= 500 else "会话请求未成功"
+            except RegistrationFlowError:
+                raise
             except Exception:
                 check_running(should_stop, deadline)
-                pass
+                last_error = "网络、页面上下文或响应格式异常"
+            wait = min(1.5, max(0, deadline - time.monotonic()))
             try:
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(wait * 1000)
             except Exception:
-                time.sleep(1.5)
-        raise RegistrationFlowError("uncertain", "ChatGPT session 未返回 accessToken", "auth_session")
+                time.sleep(wait)
+        raise RegistrationFlowError("session_unavailable", f"ChatGPT 会话未确认（HTTP {last_status}，读取 {attempts} 次；{last_error}）", "auth_session")
 
     @staticmethod
     def _bind_totp_in_browser(
@@ -1017,6 +1033,9 @@ class PlaywrightRegistrationAdapter:
         proxy = str(config.get("proxy") or "").strip() or None
         timeout = max(30, int(config.get("timeout", 900)))
         otp_timeout = max(30, int(config.get("otp_timeout", 300)))
+        page_timeout = max(5, int(config.get("page_timeout", 60)))
+        session_timeout = max(5, int(config.get("session_timeout", 60)))
+        oauth_timeout = max(5, int(config.get("oauth_timeout", 120)))
         signup_url = validate_registration_url(str(config.get("signup_url") or "https://chatgpt.com/auth/login").strip())
         registration_password = self._registration_password(item)
         headless = not bool(config.get("show_browser", False))
@@ -1108,7 +1127,7 @@ class PlaywrightRegistrationAdapter:
                         return self._fail(item, "sentinel", "needs_interaction", "页面要求人工完成安全验证", checkpoint=checkpoint)
                     mark("identity_ready")
                     email = None
-                    entry_deadline = min(deadline, time.monotonic() + 30)
+                    entry_deadline = min(deadline, time.monotonic() + page_timeout)
                     while time.monotonic() < entry_deadline and not should_stop():
                         remaining()
                         current_url, title, body = self._page_metadata(page)
@@ -1141,7 +1160,7 @@ class PlaywrightRegistrationAdapter:
                             issued_after = fallback_issued_after
                             side_effects["email_submitted"] = True
                             save_checkpoint("auth_flow", state="submitted_email")
-                            entry_deadline = min(deadline, time.monotonic() + 45)
+                            entry_deadline = min(deadline, time.monotonic() + page_timeout)
                             while time.monotonic() < entry_deadline and not should_stop():
                                 if self._stage(page) != "entry":
                                     break
@@ -1173,13 +1192,12 @@ class PlaywrightRegistrationAdapter:
                         side_effects["email_submitted"] = True
                         save_checkpoint("auth_flow", state="submitted_email")
                     password_submitted = False
-                    password_submitted_at = None
                     otp_submitted = False
                     otp_submitted_at = None
                     fallback_at = None
                     session_navigation_attempted = False
-                    seen: dict[str, int] = {}
-                    for _ in range(45):
+                    phase, phase_started = None, time.monotonic()
+                    while True:
                         for pending_response in list(pending_create_responses):
                             request = getattr(pending_response, "request", None)
                             if request is not None:
@@ -1199,12 +1217,32 @@ class PlaywrightRegistrationAdapter:
                         current_stage = self._stage(page)
                         if current_stage == "external":
                             return self._fail(item, stage, "needs_interaction", "注册跳转到了外部页面；未填写密码或验证码", checkpoint=checkpoint)
-                        if current_stage == "phone":
-                            return self._fail(item, stage, "phone_required", "账号需要补手机；注册流程未调用付费接码", checkpoint=checkpoint)
                         if any(status == 429 for _, status in auth_responses):
                             return self._fail(item, stage, "rate_limited", "注册服务限流；本批次停止", checkpoint=checkpoint)
-                        seen[current_stage] = seen.get(current_stage, 0) + 1
+                        if current_stage == "phone":
+                            return self._fail(item, stage, "phone_required", "账号需要补手机；注册流程未调用付费接码", checkpoint=checkpoint)
+                        if current_stage == "login_password":
+                            side_effects["existing_account_detected"] = True
+                            save_checkpoint("auth_flow", state="existing_account")
+                            return self._fail(item, "auth_flow", "existing_account",
+                                              "注册已转到已有账号登录页；未填写新密码，可转授权处理", checkpoint=checkpoint)
                         current_url, title, body = self._page_metadata(page)
+                        location = urlsplit(current_url)
+                        if (create_confirmed and location.hostname == "chatgpt.com"
+                                and not location.path.startswith(("/auth/", "/api/", "/backend-api/"))):
+                            # Cookie names can change. An authenticated, matching
+                            # session response remains mandatory before proceeding.
+                            current_stage = "complete"
+                        if phase != current_stage:
+                            phase, phase_started = current_stage, time.monotonic()
+                        elapsed = time.monotonic() - phase_started
+                        phase_limit = session_timeout if create_confirmed and current_stage in {"unknown", "entry"} else page_timeout
+                        if elapsed >= phase_limit:
+                            failed = next(((path, status) for path, status in reversed(auth_responses) if status >= 400), None)
+                            detail = f"；认证接口 {failed[0]} 返回 HTTP {failed[1]}" if failed else ""
+                            return self._fail(item, current_stage, "uncertain",
+                                              f"页面阶段 {current_stage} 在 {phase_limit} 秒内未推进{detail}；未重放已提交请求",
+                                              checkpoint=checkpoint)
                         entry_failure = _registration_entry_failure(0, body, title=title, url=current_url)
                         if entry_failure:
                             category, message = entry_failure
@@ -1227,30 +1265,21 @@ class PlaywrightRegistrationAdapter:
                                        "邮箱可能已经注册")
                             return self._fail(item, current_stage, category, message, checkpoint=checkpoint)
                         if create_confirmed and current_stage in {"unknown", "entry"}:
-                            if not session_navigation_attempted and seen[current_stage] > 8:
+                            if not session_navigation_attempted and elapsed >= min(10, session_timeout / 2):
                                 session_navigation_attempted = True
                                 save_checkpoint("auth_session", state="auth_session_pending")
                                 page.goto("https://chatgpt.com/", wait_until="domcontentloaded",
                                           timeout=min(30, remaining()) * 1000)
-                            elif seen[current_stage] > 30:
-                                return self._fail(item, "auth_session", "auth_session_pending",
-                                                  "账号已创建但 ChatGPT 会话未建立；未重放注册请求",
-                                                  checkpoint=checkpoint)
                             page.wait_for_timeout(1200)
                             continue
-                        if current_stage in {"unknown", "entry"} and seen[current_stage] > 8:
-                            failed = next(((path, status) for path, status in reversed(auth_responses)
-                                           if status >= 400), None)
-                            detail = (f"认证接口 {failed[0]} 返回 HTTP {failed[1]}"
-                                      if failed else "邮箱提交后页面未推进")
-                            return self._fail(item, current_stage, "uncertain",
-                                              f"{detail}；未重放已提交请求", checkpoint=checkpoint)
                         if current_stage == "complete":
                             if not password_submitted or not create_confirmed:
                                 return self._fail(item, "auth_session", "uncertain", "会话已建立但建号响应未确认", checkpoint=checkpoint)
                             mark("auth_session", state="running")
                             try:
-                                session = self._fetch_session(page, timeout=min(45, remaining()), should_stop=should_stop)
+                                session = self._fetch_session(page, timeout=min(session_timeout, remaining()), should_stop=should_stop)
+                            except RegistrationFlowError:
+                                raise
                             except Exception:
                                 remaining()
                                 return self._fail(
@@ -1260,8 +1289,8 @@ class PlaywrightRegistrationAdapter:
                                      "注册后会话未确认；请人工核对邮箱状态，未自动重放注册请求",
                                     checkpoint=checkpoint,
                                 )
-                            candidate = session.get("session") if isinstance(session.get("session"), dict) else session
-                            session_email = str((candidate.get("user") or {}).get("email") or session.get("email") or "").strip()
+                            candidate = session_candidate(session)
+                            session_email = candidate.get("email", "")
                             if not session_email or session_email.casefold() != item.email.casefold():
                                 return self._fail(
                                     item,
@@ -1270,13 +1299,11 @@ class PlaywrightRegistrationAdapter:
                                      "会话邮箱与注册邮箱不一致；未保存账号或重放注册请求",
                                     checkpoint=checkpoint,
                                 )
-                            session_access_token = str(
-                                candidate.get("accessToken") or candidate.get("access_token")
-                                or session.get("accessToken") or session.get("access_token") or ""
-                            ).strip()
+                            session_access_token = candidate.get("access_token", "")
                             if not session_access_token:
                                 return self._fail(item, "auth_session", "uncertain",
                                                   "注册后会话缺少凭据；未自动重放注册请求", checkpoint=checkpoint)
+                            side_effects["session_confirmed"] = True
                             save_checkpoint("auth_session", state="auth_session_pending")
                             totp_secret = ""
                             totp_error = ""
@@ -1321,7 +1348,7 @@ class PlaywrightRegistrationAdapter:
                                 registration_password,
                                 oauth=oauth,
                                 callback=callback,
-                                timeout=remaining(),
+                                timeout=min(oauth_timeout, remaining()),
                                 should_stop=should_stop,
                                 headless=headless,
                                 login_with_browser_fn=login_with_browser,
@@ -1345,7 +1372,6 @@ class PlaywrightRegistrationAdapter:
                             return RegistrationResult(item.email, ok=True, category="success", error="注册完成",
                                                       account=account, registration_state="completed", checkpoint={})
                         if current_stage == "password":
-                            now = time.monotonic()
                             selector = 'input[type="password"], input[name="password"], input[autocomplete="new-password"]'
                             if not password_submitted:
                                 item.password = registration_password
@@ -1356,10 +1382,7 @@ class PlaywrightRegistrationAdapter:
                                     page.locator(selector).first.press("Enter")
                                 password_submitted = True
                                 side_effects["password_submitted"] = True
-                                password_submitted_at = now
                                 mark("user_register")
-                            elif now - (password_submitted_at or now) >= 45:
-                                return self._fail(item, "user_register", "uncertain", "密码提交后页面未推进；未重放请求", checkpoint=checkpoint)
                             page.wait_for_timeout(1500)
                             continue
                         if current_stage == "otp":
@@ -1369,16 +1392,14 @@ class PlaywrightRegistrationAdapter:
                                     if clicked:
                                         fallback_at = time.monotonic()
                                     else:
-                                        if seen[current_stage] >= 3:
-                                            return self._fail(item, "email_otp_validate", "uncertain", "验证码页未找到密码注册入口，拒绝创建无密码账号", checkpoint=checkpoint)
                                         page.wait_for_timeout(1500)
                                         continue
-                                elif time.monotonic() - fallback_at >= 30:
+                                elif time.monotonic() - fallback_at >= page_timeout:
                                     return self._fail(item, "user_register", "uncertain", "密码注册入口未推进", checkpoint=checkpoint)
                                 page.wait_for_timeout(1500)
                                 continue
                             if otp_submitted:
-                                if time.monotonic() - (otp_submitted_at or time.monotonic()) >= 60:
+                                if time.monotonic() - (otp_submitted_at or time.monotonic()) >= page_timeout:
                                     return self._fail(item, "email_otp_validate", "uncertain", "验证码提交后页面未推进；未重放验证码", checkpoint=checkpoint)
                                 page.wait_for_timeout(1500)
                                 continue
@@ -1411,6 +1432,7 @@ class PlaywrightRegistrationAdapter:
                             otp_submitted = True
                             side_effects["otp_submitted"] = True
                             otp_submitted_at = time.monotonic()
+                            phase_started = otp_submitted_at
                             save_checkpoint("email_otp_validate", state="otp_submitted")
                             page.wait_for_timeout(2000)
                             continue
@@ -1445,13 +1467,9 @@ class PlaywrightRegistrationAdapter:
                                             button.click(timeout=3000)
                                             page.wait_for_timeout(1500)
                                             continue
-                                if seen[current_stage] >= 25:
-                                    return self._fail(item, current_stage, "uncertain", "邮箱验证页未出现验证码输入框；未重复点击或提交邮箱", checkpoint=checkpoint)
                                 page.wait_for_timeout(1200)
                                 continue
                             if side_effects.get("email_verification_attempted"):
-                                if seen[current_stage] >= 25:
-                                    return self._fail(item, current_stage, "uncertain", "邮箱验证页未推进；未重复点击验证按钮", checkpoint=checkpoint)
                                 page.wait_for_timeout(1200)
                                 continue
                             button = self._visible(page, [
@@ -1461,8 +1479,6 @@ class PlaywrightRegistrationAdapter:
                                 'button:has-text("Done")',
                             ])
                             if button is None:
-                                if seen[current_stage] >= 25:
-                                    return self._fail(item, current_stage, "uncertain", "验证码提交后页面未推进；未重复提交验证码", checkpoint=checkpoint)
                                 page.wait_for_timeout(1200)
                                 continue
                             side_effects["email_verification_attempted"] = True
@@ -1471,16 +1487,14 @@ class PlaywrightRegistrationAdapter:
                             page.wait_for_timeout(1500)
                             continue
                         page.wait_for_timeout(1200)
-                    return self._fail(item, stage, "uncertain", "注册状态机超出最大步数；未自动重放请求", checkpoint=checkpoint)
         except MailboxError as exc:
             category = "cancelled" if exc.category == "cancelled" else "uncertain"
             return self._fail(item, stage, category, str(exc), checkpoint=checkpoint)
         except RegistrationPersistenceError:
             raise
         except RegistrationFlowError as exc:
-            category = "auth_session_pending" if create_confirmed else exc.category
-            message = ("账号已创建但后续会话步骤未确认；请恢复会话或人工核对，未自动重放注册请求"
-                       if create_confirmed else str(exc))
+            category = "auth_session_pending" if create_confirmed and exc.category != "rate_limited" else exc.category
+            message = (("账号已创建；" if create_confirmed else "") + str(exc))
             return self._fail(item, exc.stage, category, message, checkpoint=checkpoint)
         except AuthFlowError as exc:
             category = getattr(exc, "category", "uncertain")

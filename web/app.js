@@ -70,6 +70,7 @@ const states = {
   auth_session_pending: "会话待恢复",
   partial_registered: "半注册",
   existing_account: "邮箱已存在",
+  registration_blocked: "已有注册记录",
 };
 const good = (s) => ["success", "created", "updated"].includes(s),
   pending = (s) =>
@@ -84,6 +85,7 @@ const good = (s) => ["success", "created", "updated"].includes(s),
       "auth_session_pending",
       "partial_registered",
       "existing_account",
+      "registration_blocked",
     ].includes(s);
 async function api(path, method = "GET", data, blob = false) {
   const options = {
@@ -192,7 +194,7 @@ function running(v) {
   return `<h3>运行设置</h3>${page === "auth" ? loginSettings(v) : ""}${input("timeout", "每账号处理超时（秒）", v, "number")}${check("show_browser", "显示浏览器（网页内查看与操作）", v)}${check("human_pacing", "启用步骤等待", v)}${input("human_scale", "等待时间倍数", v, "number")}`;
 }
 function registrationSettings(v) {
-  return `${network(v)}<h3>注册运行</h3>${input("timeout", "每账号处理超时（秒）", v, "number")}${input("otp_timeout", "邮箱验证码超时（秒）", v, "number")}${input("signup_url", "注册入口 URL", v)}${select("driver", "注册适配器", v, [["disabled", "未启用（仅检查输入）"], ["fixture", "本地合成 fixture"], ["playwright", "受控 Playwright 浏览器"]])}${check("show_browser", "在服务器显示窗口（不支持网页接管）", v)}${check("require_totp", "注册后绑定二次验证", v)}<p class="hint">注册入口仅支持 ChatGPT / OpenAI 官方域名。CAPTCHA、安全挑战、已有账号或结果不明确时停止并保留恢复记录；不会自动重放提交。默认驱动仍未启用。</p>`;
+  return `${network(v)}<h3>注册运行</h3>${input("timeout", "每账号总超时（秒）", v, "number")}<div class="two-cols">${input("page_timeout", "页面推进超时（秒）", v, "number")}${input("otp_timeout", "邮箱验证码超时（秒）", v, "number")}${input("session_timeout", "会话读取超时（秒）", v, "number")}${input("oauth_timeout", "OAuth 超时（秒）", v, "number")}</div>${input("signup_url", "注册入口 URL", v)}${select("driver", "注册适配器", v, [["disabled", "未启用（仅检查输入）"], ["fixture", "本地合成 fixture"], ["playwright", "受控 Playwright 浏览器"]])}${check("show_browser", "在服务器显示窗口（不支持网页接管）", v)}${check("require_totp", "注册后绑定二次验证", v)}<p class="hint">各阶段受总超时约束。已有注册记录会关联原任务；已建号可转授权补做 OAuth，明确待补手机可转接码。未确认的提交不会自动重放，2FA 激活待核对时保留原密钥。</p>`;
 }
 function renderSettings() {
   if (!["auth", "register", "phone", "pool"].includes(page)) return;
@@ -531,8 +533,9 @@ async function navigate(next) {
   }[page];
   $("#defer").hidden = page !== "pool";
   $$("[data-tab=inspection]").forEach((b) => (b.hidden = page !== "pool"));
-  $("#transfer-pool").hidden = page === "pool" || page === "register";
-  $("#transfer-phone").hidden = page === "register";
+  $("#transfer-pool").hidden = page === "pool";
+  $("#transfer-phone").hidden = false;
+  $("#transfer-auth").hidden = page !== "register";
   $("#export-registration-text").hidden = page !== "register";
   $("#export-hint").textContent = page === "register"
     ? "已勾选时仅导出选中账号；CPA 不保留密码和 2FA"
@@ -548,6 +551,12 @@ function tab(name) {
   );
   for (const n of ["results", "logs", "inspection"])
     $("#" + n + "-panel").hidden = n !== name;
+}
+function renderRegistration(r) {
+  if (!r.registration) return "";
+  const f = r.registration.facts;
+  const details = `账号：${f.creation} · 会话：${f.session} · 2FA：${f.totp} · OAuth：${f.oauth}`;
+  return `<small class="hint">${esc(details)}</small>${r.source_task ? `<button class="ghost" data-registration-source="${esc(r.source_task)}">查看原任务</button>` : ""}`;
 }
 function renderTask() {
   const t = current;
@@ -582,10 +591,19 @@ function renderTask() {
   $("#result-rows").innerHTML = shown
     .map(
       (r) =>
-        `<tr><td><input type="checkbox" data-row="${esc(r.uid)}" ${r.selectable === false ? "disabled" : ""} ${selected.has(r.uid) ? "checked" : ""}></td><td>${esc(r.email)}${r.line ? `<small class="hint">第 ${r.line} 行</small>` : ""}</td><td class="${good(r.state) ? "success" : pending(r.state) ? "" : "error"}">${esc(r.stage_active ? "处理中" : states[r.state] || r.state)}</td><td>${esc(r.account_id || "—")}</td><td>${esc(r.message)}${renderSteps(r)}</td></tr>`,
+        `<tr><td><input type="checkbox" data-row="${esc(r.uid)}" ${r.selectable === false ? "disabled" : ""} ${selected.has(r.uid) ? "checked" : ""}></td><td>${esc(r.email)}${r.line ? `<small class="hint">第 ${r.line} 行</small>` : ""}</td><td class="${good(r.state) ? "success" : pending(r.state) ? "" : "error"}">${esc(r.stage_active ? "处理中" : states[r.state] || r.state)}</td><td>${esc(r.account_id || "—")}</td><td>${esc(r.message)}${renderRegistration(r)}${renderSteps(r)}</td></tr>`,
     )
     .join("");
   $("#result-empty").hidden = Boolean(rows.length);
+  $$("[data-registration-source]").forEach((b) => b.onclick = act(async () => {
+    const original = await api("/tasks/" + encodeURIComponent(b.dataset.registrationSource));
+    taskByPage.register = original;
+    await navigate("register");
+  }));
+  for (const target of ["auth", "phone", "pool"]) {
+    const button = $("#transfer-" + target);
+    button.disabled = page === "register" && (Boolean(active) || !rows.some(r => r.registration?.actions.includes(target)));
+  }
   $$("[data-row]").forEach(
     (n) =>
       (n.onchange = () =>
@@ -1031,7 +1049,7 @@ on("#import-files", () => picker(false, "work"));
 on("#import-folder", () => picker(true, "work"));
 $("#file-picker").onchange = act(readFiles);
 $("#folder-picker").onchange = act(readFiles);
-for (const target of ["pool", "phone"])
+for (const target of ["pool", "phone", "auth"])
   on("#transfer-" + target, async () => {
     if (!current?.id) throw Error("请先打开任务结果");
     const result = await api("/tasks/" + current.id + "/transfer", "POST", {
@@ -1040,6 +1058,7 @@ for (const target of ["pool", "phone"])
     });
     drafts[target] = result.text;
     await navigate(target);
+    if (target === "auth") notify("已转入授权页；请核对登录方式和网络后点击开始授权。2FA 待核对的记录保留原密钥，不会重新绑定。");
   });
 for (const target of ["sub2", "sub2-single", "cpa", "registration-text"])
   on("#export-" + target, async () => {

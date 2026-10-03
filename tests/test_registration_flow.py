@@ -284,6 +284,8 @@ def test_confirmed_creation_keeps_session_pending_on_unknown_page():
 
 
 def test_confirmed_creation_navigates_to_session_once_without_resubmitting(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr('registration_flow.time.monotonic', lambda: clock[0])
     class Mailbox:
         def __init__(self, *_args, **_kwargs):
             pass
@@ -321,8 +323,8 @@ def test_confirmed_creation_navigates_to_session_once_without_resubmitting(monke
         def inner_text(self, *_args):
             return ""
 
-        def wait_for_timeout(self, *_args):
-            pass
+        def wait_for_timeout(self, milliseconds):
+            clock[0] += milliseconds / 1000
 
     page = Page()
 
@@ -361,7 +363,7 @@ def test_confirmed_creation_navigates_to_session_once_without_resubmitting(monke
     monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: Playwright())
     monkeypatch.setattr("openai_reauth.launch_browser", lambda *_args, **_kwargs: Browser())
     result = Adapter().register(
-        load_registration_inputs(registration_text())[0], config={"timeout": 30},
+        load_registration_inputs(registration_text())[0], config={"timeout": 30, "session_timeout": 5},
         should_stop=lambda: False, on_stage=lambda _stage: None, checkpoint={},
     )
     assert result.category == "auth_session_pending"
@@ -370,8 +372,11 @@ def test_confirmed_creation_navigates_to_session_once_without_resubmitting(monke
 
 
 @pytest.mark.parametrize("continuation_present", [False, True])
-def test_verification_route_advances_at_most_once_before_otp(monkeypatch, continuation_present):
+@pytest.mark.parametrize("page_budget", [5, 90])
+def test_verification_route_advances_at_most_once_before_otp(monkeypatch, continuation_present, page_budget):
     clicks = []
+    clock = [1000.0]
+    monkeypatch.setattr('registration_flow.time.monotonic', lambda: clock[0])
 
     class Button:
         def click(self, **_kwargs):
@@ -408,8 +413,8 @@ def test_verification_route_advances_at_most_once_before_otp(monkeypatch, contin
         def inner_text(self, *_args):
             return ""
 
-        def wait_for_timeout(self, *_args):
-            pass
+        def wait_for_timeout(self, milliseconds):
+            clock[0] += milliseconds / 1000
 
     class Browser:
         def new_context(self):
@@ -445,7 +450,7 @@ def test_verification_route_advances_at_most_once_before_otp(monkeypatch, contin
     monkeypatch.setattr("openai_reauth.launch_browser", lambda *_args, **_kwargs: Browser())
     item = load_registration_inputs(registration_text())[0]
     checkpoints = []
-    result = Adapter().register(item, config={"timeout": 30}, should_stop=lambda: False,
+    result = Adapter().register(item, config={"timeout": page_budget+30, "page_timeout": page_budget}, should_stop=lambda: False,
                                 on_stage=lambda _stage: None, checkpoint={},
                                 on_checkpoint=checkpoints.append)
     assert result.category == "uncertain"
@@ -456,6 +461,7 @@ def test_verification_route_advances_at_most_once_before_otp(monkeypatch, contin
     })
     assert clicks == (["continue"] if continuation_present else [])
     assert len(checkpoints) < 10
+    assert clock[0] >= 1000 + page_budget  # More than 45 polls may still be valid.
 
 
 def test_uncertain_checkpoint_is_not_replayed_or_written_with_password(tmp_path):
