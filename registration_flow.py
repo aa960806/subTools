@@ -241,9 +241,16 @@ def load_registration_inputs(text: str | dict[str, Any], max_accounts: int = 200
             errors.append(f"第 1 行: {exc}")
     elif isinstance(text, str):
         try:
-            for index, (line, value) in enumerate(input_records(text), 1):
-                if len(items) >= max_accounts:
-                    raise ValueError(f"单批最多 {max_accounts} 条注册记录")
+            records = list(input_records(text))
+        except ValueError as exc:
+            raise ValueError("输入格式无效：" + str(exc)) from None
+        if len(records) > max_accounts:
+            raise ValueError(
+                f"当前输入包含 {len(records)} 条注册记录，单批最多 {max_accounts} 条；"
+                "请拆分为多个批次后再识别"
+            )
+        try:
+            for index, (line, value) in enumerate(records, 1):
                 try:
                     items.append(_parse_value(value, line))
                 except ValueError as exc:

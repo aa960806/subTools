@@ -513,7 +513,7 @@ async function navigate(next) {
     history: "查阅、恢复与继续你的处理任务。",
   }[page];
   $("#input-hint").textContent = page === "register"
-    ? "每行填写邮箱、密码和邮箱接码地址；接码地址必须与邮箱严格匹配。也支持 registration JSON。"
+    ? "每个账号一行；长行可横向滚动。支持：邮箱----密码----邮箱接码地址，或邮箱----邮箱密码----clientid----刷新令牌；也支持 registration JSON。"
     : "支持账号行、sub2 / CPA / Session / 9router JSON；多个账号分行输入。";
   $("#work-page").hidden = !["auth", "register", "phone", "pool"].includes(page);
   $("#convert-page").hidden = page !== "convert";

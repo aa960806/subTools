@@ -369,6 +369,12 @@ header .badge {
   min-height: 180px;
   height: 205px;
 }
+#account-input {
+  white-space: pre;
+  overflow-wrap: normal;
+  word-break: normal;
+  overflow-x: auto;
+}
 .stats {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

@@ -88,6 +88,16 @@ def test_graph_mailbox_password_is_not_used_as_registration_password():
     assert item.password == ""
 
 
+def test_registration_limit_reports_actual_count_and_split_guidance():
+    source = "\n".join(
+        f"user{i}@example.com----pass{i}----12345678-1234-1234-1234-123456789012----refresh-{i}"
+        for i in range(201)
+    )
+    assert len(load_registration_inputs('\n'.join(source.splitlines()[:200]), 200)) == 200
+    with pytest.raises(ValueError, match="^当前输入包含 201 条注册记录.*拆分"):
+        load_registration_inputs(source, 200)
+
+
 def test_registered_oauth_delegates_to_shared_browser_state_machine():
     item = load_registration_inputs(registration_text())[0]
     item.totp_secret = "JBSWY3DPEHPK3PXP"
